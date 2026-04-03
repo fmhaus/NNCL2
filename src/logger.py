@@ -8,12 +8,10 @@ import pandas as pd
 import torch
 
 try:
-    from openbayestool import log_param, log_metric, clear_metric # type: ignore
+    from openbayestool import log_metric, clear_metric # type: ignore
     _OPENBAYESTOOL_AVAILABLE = True
 except ImportError:
-    def log_param(*args, **kwargs): pass   # type: ignore[misc]
     def log_metric(*args, **kwargs): pass  # type: ignore[misc]
-    def clear_param(*args, **kwargs): pass  # type: ignore[misc]
     def clear_metric(*args, **kwargs): pass  # type: ignore[misc]
     _OPENBAYESTOOL_AVAILABLE = False
 
@@ -44,7 +42,6 @@ class TrainingLogger:
       state_XXXX.ckpt — latest checkpoint only (previous deleted on save)
 
     Optionally integrates with openbayestool:
-      - hparams logged once with log_param
       - metrics logged each epoch with log_metric
       - all metric keys cleared at init with clear_metric
     """
@@ -72,10 +69,6 @@ class TrainingLogger:
             # Clear stale metric data from any previous run
             for key in _METRIC_KEYS:
                 clear_metric(key)
-
-            # Log all hparams once
-            for key, value in vars(args).items():
-                log_param(key, value)
 
     def log(self, epoch: int, metrics: dict[str, float]) -> None:
         """Log metrics for one epoch — console + metrics.csv + openbayestool."""
