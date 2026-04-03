@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import SGD, Adam
+from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp.grad_scaler import GradScaler
 
@@ -77,7 +77,7 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifier, loader, criterion, optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     classifier.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
@@ -90,33 +90,23 @@ def train_epoch(model, classifier, loader, criterion, optimizer, cls_optimizer, 
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        # --- Backbone + projector (NCE loss only) ---
         with autocast:
             feat1    = model.encode(view1)
             feat2    = model.encode(view2)
             nce_loss = criterion(model.projector(feat1), model.projector(feat2))
+            # Detach so cls gradients don't flow into the backbone
+            logits   = classifier(feat1.detach())
+            cls_loss = F.cross_entropy(logits, labels)
+            loss     = nce_loss + cls_loss
 
         optimizer.zero_grad()
         if scaler is not None:
-            scaler.scale(nce_loss).backward()
+            scaler.scale(loss).backward()
             scaler.step(optimizer)
-        else:
-            nce_loss.backward()
-            optimizer.step()
-
-        # --- Classifier (detached features, separate backward) ---
-        with autocast:
-            logits   = classifier(feat1.detach())
-            cls_loss = F.cross_entropy(logits, labels)
-
-        cls_optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(cls_loss).backward()
-            scaler.step(cls_optimizer)
             scaler.update()
         else:
-            cls_loss.backward()
-            cls_optimizer.step()
+            loss.backward()
+            optimizer.step()
 
         acc1, acc5 = _topk_accuracy(logits.detach(), labels)
         b          = labels.size(0)
@@ -219,29 +209,26 @@ def knn_accuracy(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _checkpoint_state(epoch, model, classifier, optimizer, cls_optimizer, scheduler, scaler, args) -> dict:
+def _checkpoint_state(epoch, model, classifier, optimizer, scheduler, scaler, args) -> dict:
     state = {
-        "epoch":         epoch,
-        "model":         model.state_dict(),
-        "classifier":    classifier.state_dict(),
-        "optimizer":     optimizer.state_dict(),
-        "cls_optimizer": cls_optimizer.state_dict(),
-        "scheduler":     scheduler.state_dict(),
-        "args":          vars(args),
+        "epoch":      epoch,
+        "model":      model.state_dict(),
+        "classifier": classifier.state_dict(),
+        "optimizer":  optimizer.state_dict(),
+        "scheduler":  scheduler.state_dict(),
+        "args":       vars(args),
     }
     if scaler is not None:
         state["scaler"] = scaler.state_dict()
     return state
 
 
-def load_checkpoint(path, model, classifier, optimizer, cls_optimizer, scheduler, scaler) -> int:
+def load_checkpoint(path, model, classifier, optimizer, scheduler, scaler) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
     if "classifier" in ckpt:
         classifier.load_state_dict(ckpt["classifier"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    if "cls_optimizer" in ckpt:
-        cls_optimizer.load_state_dict(ckpt["cls_optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
@@ -370,15 +357,20 @@ def main():
     model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
-    optimizer     = SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
-    cls_optimizer = Adam(classifier.parameters(), lr=args.classifier_lr)
+    optimizer = SGD(
+        [
+            {"params": model.parameters()},
+            {"params": classifier.parameters(), "lr": args.classifier_lr, "weight_decay": 0.0},
+        ],
+        lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
+    )
     scheduler = make_scheduler(optimizer, args.max_epochs, args.warmup_epochs)
     autocast  = make_autocast(args.precision, device)
     scaler    = make_scaler(args.precision, device)
 
     start_epoch = 0
     if resume_ckpt is not None:
-        start_epoch = load_checkpoint(resume_ckpt, model, classifier, optimizer, cls_optimizer, scheduler, scaler)
+        start_epoch = load_checkpoint(resume_ckpt, model, classifier, optimizer, scheduler, scaler)
 
     # Keep uncompiled references for state dict I/O — torch.compile wraps the
     # module and _model.state_dict() returns mangled keys.
@@ -391,7 +383,7 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0           = time.perf_counter()
-        train_m            = train_epoch(model, classifier, train_loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+        train_m            = train_epoch(model, classifier, train_loader, criterion, optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
         scheduler.step()
         knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
@@ -411,7 +403,7 @@ def main():
             "epoch_time_s":     epoch_time,
         }
         logger.log(epoch + 1, metrics)
-        logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifier_for_ckpt, optimizer, cls_optimizer, scheduler, scaler, args))
+        logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifier_for_ckpt, optimizer, scheduler, scaler, args))
 
     print("Training complete.")
 
