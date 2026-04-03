@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp.grad_scaler import GradScaler
 
@@ -366,7 +366,7 @@ def main():
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
     optimizer     = SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
-    cls_optimizer = SGD(classifier.parameters(), lr=args.classifier_lr, momentum=0.9)
+    cls_optimizer = Adam(classifier.parameters(), lr=args.classifier_lr)
     scheduler = make_scheduler(optimizer, args.max_epochs, args.warmup_epochs)
     autocast  = make_autocast(args.precision, device)
     scaler    = make_scaler(args.precision, device)
