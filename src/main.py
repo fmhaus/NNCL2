@@ -24,6 +24,7 @@ from logger import TrainingLogger
 from losses import NTXentLoss
 from model import SimCLRModel, LinearClassifier
 
+torch.set_float32_matmul_precision('high')
 
 # ---------------------------------------------------------------------------
 # Precision helpers
