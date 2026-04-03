@@ -1,6 +1,9 @@
+from typing import Literal
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import resnet18
+
 
 BACKBONE_DIM = 512  # ResNet18 output dimension
 
@@ -27,6 +30,8 @@ class SimCLRModel(nn.Module):
         proj_hidden: int = 512,
         proj_dim: int = 128,
         image_size: int = 224,
+        feature_transform: None | Literal["relu", "simplex_proj", "softmax", "L1_norm"] = None,
+        use_projector: bool = True
     ):
         super().__init__()
 
@@ -40,13 +45,27 @@ class SimCLRModel(nn.Module):
 
         self.backbone = nn.Sequential(*list(base.children())[:-1])  # (B, 512, 1, 1)
 
-        self.projector = nn.Sequential(
-            nn.Linear(BACKBONE_DIM, proj_hidden),
-            nn.BatchNorm1d(proj_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_hidden, proj_dim),
-            nn.BatchNorm1d(proj_dim),
-        )
+        if feature_transform is None:
+            self.feature_transform = nn.Identity()
+        elif feature_transform == "relu":
+            self.feature_transform = ReluGeluGrad()
+        elif feature_transform == "softmax":
+            self.feature_transform = nn.Softmax()
+        elif feature_transform == "L1_norm":
+            self.feature_transform = ShiftL1Norm()
+            
+
+
+        if use_projector:
+            self.projector = nn.Sequential(
+                nn.Linear(BACKBONE_DIM, proj_hidden),
+                nn.BatchNorm1d(proj_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_hidden, proj_dim),
+                nn.BatchNorm1d(proj_dim),
+            )
+        else:
+            self.projector = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns projected embeddings — used for the SSL contrastive loss."""
@@ -54,7 +73,22 @@ class SimCLRModel(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Returns backbone embeddings (512-dim) — used for downstream evaluation."""
-        return self.backbone(x).flatten(1)
+        return self.feature_transform(self.backbone(x).flatten(1))
+
+
+class ShiftL1Norm(nn.Module):
+    """Shift to non-negative then L1-normalize: (x - min) / sum(x - min)."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - x.min(dim=1, keepdim=True).values
+        return x / x.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+
+class ReluGeluGrad(nn.Module):
+    """Forward pass of ReLU, backward pass (gradient) of GELU.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x).detach() + F.gelu(x) - F.gelu(x).detach()
+    
 
 
 class LinearClassifier(nn.Module):

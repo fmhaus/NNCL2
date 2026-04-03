@@ -265,8 +265,13 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim", default=2048,       type=int)
-    p.add_argument("--proj-output-dim", default=128,        type=int)
+    p.add_argument("--proj-hidden-dim",    default=2048,       type=int)
+    p.add_argument("--proj-output-dim",    default=128,        type=int)
+    p.add_argument("--no-projector",       action="store_true",
+                   help="Disable the projection head (apply loss directly on backbone features).")
+    p.add_argument("--feature-transform",  default=None,
+                   choices=["relu", "softmax", "L1_norm"],
+                   help="Non-negative transform applied to backbone features before projector and downstream tasks.")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")
     p.add_argument("--max-epochs",      default=200,        type=int)
@@ -362,7 +367,7 @@ def main():
         knn_val   = get_eval_loader(TinyImageNetDataset("valid"), args.batch_size, normalize, image_size, args.num_workers)
 
     # --- Model, classifier, loss, optimiser ---
-    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size).to(device)
+    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
     optimizer     = SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
