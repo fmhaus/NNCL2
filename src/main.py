@@ -335,6 +335,9 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True  # auto-tune kernels for fixed input sizes
 
+    if args.lr is None:
+        args.lr = 0.3 * args.batch_size / 256
+
     logger = TrainingLogger(save_dir, args, console_log=args.console_log)
 
     print(f"Method: {args.method} | Dataset: {args.dataset} | Device: {device} | Precision: {args.precision}")
@@ -357,11 +360,10 @@ def main():
         knn_val   = get_eval_loader(TinyImageNetDataset("valid"), args.batch_size, normalize, image_size, args.num_workers)
 
     # --- Model, classifier, loss, optimiser ---
-    model      = SimCLRModel(pretrained=False, proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim).to(device)
+    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size).to(device)
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
-    lr         = args.lr if args.lr is not None else 0.3 * args.batch_size / 256
-    optimizer     = SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
+    optimizer     = SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     cls_optimizer = SGD(classifier.parameters(), lr=args.classifier_lr, momentum=0.9)
     scheduler = make_scheduler(optimizer, args.max_epochs, args.warmup_epochs)
     autocast  = make_autocast(args.precision, device)

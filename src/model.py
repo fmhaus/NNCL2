@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet18
 
 BACKBONE_DIM = 512  # ResNet18 output dimension
 
@@ -17,7 +17,6 @@ class SimCLRModel(nn.Module):
     not the projector output (the paper ablates this — projector hurts linear probe).
 
     Args:
-        pretrained:  Load ImageNet weights for the backbone.
         proj_hidden: Hidden dim of the projection MLP (paper uses 2048 for ResNet50;
                      512 is standard for ResNet18).
         proj_dim:    Output dim of the projector (paper: 128).
@@ -25,14 +24,20 @@ class SimCLRModel(nn.Module):
 
     def __init__(
         self,
-        pretrained: bool = True,
         proj_hidden: int = 512,
         proj_dim: int = 128,
+        image_size: int = 224,
     ):
         super().__init__()
 
-        weights = ResNet18_Weights.DEFAULT if pretrained else None
-        base = resnet18(weights=weights)
+        base = resnet18(weights=None)
+
+        if image_size <= 64:
+            # Replace 7×7 stride-2 conv + maxpool with 3×3 stride-1 conv.
+            # Preserves spatial resolution for small images (CIFAR-100: 32, TinyImageNet: 64).
+            base.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            base.maxpool = nn.Identity() # type: ignore
+
         self.backbone = nn.Sequential(*list(base.children())[:-1])  # (B, 512, 1, 1)
 
         self.projector = nn.Sequential(
