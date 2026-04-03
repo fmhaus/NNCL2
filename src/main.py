@@ -251,7 +251,7 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim",    default=2048,       type=int)
+    p.add_argument("--proj-hidden-dim",    default=512,        type=int)
     p.add_argument("--proj-output-dim",    default=128,        type=int)
     p.add_argument("--no-projector",       action="store_true",
                    help="Disable the projection head (apply loss directly on backbone features).")
@@ -269,8 +269,8 @@ def parse_args():
 
     p.add_argument("--classifier-lr",   default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
-    p.add_argument("--temperature",     default=0.1,        type=float,
-                   help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
+    p.add_argument("--temperature",     default=0.5,        type=float,
+                   help="NT-Xent temperature. Paper: 0.5 for CIFAR, 0.07 for ImageNet.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
