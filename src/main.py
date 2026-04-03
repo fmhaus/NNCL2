@@ -77,7 +77,7 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, cls_loss_scale: float = 0.1, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifier, loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     classifier.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
@@ -90,29 +90,32 @@ def train_epoch(model, classifier, loader, criterion, optimizer, cls_optimizer, 
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
+        # --- Backbone + projector (NCE loss only) ---
         with autocast:
-            # Encode each view once; reuse features for projector + classifier
-            feat1 = model.encode(view1)
-            feat2 = model.encode(view2)
-
+            feat1    = model.encode(view1)
+            feat2    = model.encode(view2)
             nce_loss = criterion(model.projector(feat1), model.projector(feat2))
 
-            # Detach so classifier gradients don't flow into the backbone
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(nce_loss).backward()
+            scaler.step(optimizer)
+        else:
+            nce_loss.backward()
+            optimizer.step()
+
+        # --- Classifier (detached features, separate backward) ---
+        with autocast:
             logits   = classifier(feat1.detach())
             cls_loss = F.cross_entropy(logits, labels)
 
-            loss = nce_loss + cls_loss_scale * cls_loss
-
-        optimizer.zero_grad()
         cls_optimizer.zero_grad()
         if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            scaler.scale(cls_loss).backward()
             scaler.step(cls_optimizer)
             scaler.update()
         else:
-            loss.backward()
-            optimizer.step()
+            cls_loss.backward()
             cls_optimizer.step()
 
         acc1, acc5 = _topk_accuracy(logits.detach(), labels)
@@ -272,8 +275,7 @@ def parse_args():
     p.add_argument("--lr",              default=None,       type=float,
                    help="Learning rate. Default: 0.3 * batch_size / 256.")
     p.add_argument("--weight-decay",     default=1e-4,       type=float)
-    p.add_argument("--cls-loss-scale",   default=0.1,        type=float,
-                   help="Scale factor applied to cls_loss before adding to nce_loss.")
+
     p.add_argument("--classifier-lr",   default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
     p.add_argument("--temperature",     default=0.1,        type=float,
@@ -384,7 +386,7 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0           = time.perf_counter()
-        train_m            = train_epoch(model, classifier, train_loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, args.cls_loss_scale, args.tqdm, epoch=epoch + 1)
+        train_m            = train_epoch(model, classifier, train_loader, criterion, optimizer, cls_optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
         scheduler.step()
         knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
