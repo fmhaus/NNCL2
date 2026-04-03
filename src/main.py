@@ -276,8 +276,8 @@ def parse_args():
                    help="Scale factor applied to cls_loss before adding to nce_loss.")
     p.add_argument("--classifier-lr",   default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
-    p.add_argument("--temperature",     default=0.5,        type=float,
-                   help="NT-Xent temperature. Paper: 0.5 for CIFAR, 0.07 for ImageNet.")
+    p.add_argument("--temperature",     default=0.1,        type=float,
+                   help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
