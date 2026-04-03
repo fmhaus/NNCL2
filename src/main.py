@@ -78,20 +78,13 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> tuple[dict, torch.Tensor, torch.Tensor]:
-    """Returns (metrics, train_feats, train_labels).
-
-    train_feats/labels are augmented features accumulated inline — passed
-    directly to knn_accuracy so no separate clean-loader kNN train pass is needed.
-    """
+def train_epoch(model, classifier, loader, criterion, optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     classifier.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
     sum_nce = sum_cls = 0.0
     sum_acc1 = sum_acc5 = n_samples = 0
-    all_feats: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
         view1  = view1.to(device, non_blocking=is_cuda)
@@ -117,9 +110,6 @@ def train_epoch(model, classifier, loader, criterion, optimizer, device, autocas
             loss.backward()
             optimizer.step()
 
-        all_feats.append(feat1.detach().cpu())
-        all_labels.append(labels.cpu())
-
         acc1, acc5 = _topk_accuracy(logits1.detach(), labels)
         b          = labels.size(0)
         sum_nce   += nce_loss.item()
@@ -129,16 +119,12 @@ def train_epoch(model, classifier, loader, criterion, optimizer, device, autocas
         n_samples += b
 
     n = len(loader)
-    return (
-        {
-            "train_nce_loss":   sum_nce  / n,
-            "train_class_loss": sum_cls  / n,
-            "train_acc1_epoch": sum_acc1 / n_samples,
-            "train_acc5_epoch": sum_acc5 / n_samples,
-        },
-        torch.cat(all_feats),
-        torch.cat(all_labels),
-    )
+    return {
+        "train_nce_loss":   sum_nce  / n,
+        "train_class_loss": sum_cls  / n,
+        "train_acc1_epoch": sum_acc1 / n_samples,
+        "train_acc5_epoch": sum_acc5 / n_samples,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -179,28 +165,25 @@ def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, e
 
 @torch.no_grad()
 def knn_accuracy(
-    model, train_feats: torch.Tensor, train_labels: torch.Tensor, val_loader, device,
+    model, train_loader, val_loader, device,
     k: int = 20, temperature: float = 0.07, use_tqdm: bool = False, epoch: int = 0,
 ) -> tuple[float, float]:
-    """Returns (top-1 kNN acc, top-5 kNN acc).
-
-    train_feats/labels: pre-computed from train_epoch (augmented, on CPU).
-    val_loader: clean eval loader — features extracted here.
-    """
+    """Returns (top-1 kNN acc, top-5 kNN acc)."""
     model.eval()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    val_feats_list, val_labels_list = [], []
-    for images, targets in _wrap_tqdm(val_loader, use_tqdm, desc=f"knn-val [epoch {epoch}]", leave=False):
-        val_feats_list.append(model.encode(images.to(device, non_blocking=is_cuda)).cpu())
-        val_labels_list.append(targets)
-    val_feats  = torch.cat(val_feats_list)
-    val_labels = torch.cat(val_labels_list)
+    def extract(loader, desc):
+        feats, labels = [], []
+        for images, targets in _wrap_tqdm(loader, use_tqdm, desc=desc, leave=False):
+            feats.append(model.encode(images.to(device, non_blocking=is_cuda)))
+            labels.append(targets.to(device, non_blocking=is_cuda))
+        return torch.cat(feats), torch.cat(labels)
 
-    train_feats  = nn.functional.normalize(train_feats.to(device),  dim=1)
-    val_feats    = nn.functional.normalize(val_feats.to(device),    dim=1)
-    train_labels = train_labels.to(device)
-    val_labels   = val_labels.to(device)
+    train_feats, train_labels = extract(train_loader, f"knn-train [epoch {epoch}]")
+    val_feats,   val_labels   = extract(val_loader,   f"knn-val   [epoch {epoch}]")
+
+    train_feats = nn.functional.normalize(train_feats, dim=1)
+    val_feats   = nn.functional.normalize(val_feats,   dim=1)
 
     num_classes = int(train_labels.max().item()) + 1
     correct1 = correct5 = 0
@@ -362,25 +345,36 @@ def main():
 
     if args.dataset == "cifar100":
         from torchvision import datasets as tv_datasets
-        knn_val = get_eval_loader(tv_datasets.CIFAR100(args.data_root, train=False, download=True, transform=None), args.batch_size, normalize, image_size, args.num_workers)
+        knn_train = get_eval_loader(tv_datasets.CIFAR100(args.data_root, train=True,  download=True, transform=None), args.batch_size, normalize, image_size, args.num_workers)
+        knn_val   = get_eval_loader(tv_datasets.CIFAR100(args.data_root, train=False, download=True, transform=None), args.batch_size, normalize, image_size, args.num_workers)
     else:
         from dataset import TinyImageNetDataset
-        knn_val = get_eval_loader(TinyImageNetDataset("valid"), args.batch_size, normalize, image_size, args.num_workers)
+        knn_train = get_eval_loader(TinyImageNetDataset("train"), args.batch_size, normalize, image_size, args.num_workers)
+        knn_val   = get_eval_loader(TinyImageNetDataset("valid"), args.batch_size, normalize, image_size, args.num_workers)
 
     # --- Model, classifier, loss, optimiser ---
     model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
+
+    # Exclude normalization from weight decay
+    _norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)
+    decay, no_decay = [], []
+    for module in model.modules():
+        if isinstance(module, _norm_types):
+            no_decay.extend(module.parameters(recurse=False))
+        else:
+            decay.extend(p for p in module.parameters(recurse=False) if p.requires_grad)
+
     optimizer = SGD(
         [
-            {"params": model.parameters()},
-            {"params": classifier.parameters(), "lr": args.classifier_lr, "weight_decay": 0.0},
+            {"params": decay},
+            {"params": no_decay,                  "weight_decay": 0.0},
+            {"params": classifier.parameters(),   "weight_decay": 0.0, "lr": args.classifier_lr},
         ],
         lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
     )
     scheduler = make_scheduler(optimizer, args.max_epochs, args.warmup_epochs)
-    # Classifier LR is fixed — pin initial_lr so the scheduler never scales it
-    optimizer.param_groups[1]["initial_lr"] = args.classifier_lr
     autocast  = make_autocast(args.precision, device)
     scaler    = make_scaler(args.precision, device)
 
@@ -399,10 +393,9 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0           = time.perf_counter()
-        train_m, knn_train_feats, knn_train_labels = train_epoch(model, classifier, train_loader, criterion, optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+        train_m    = train_epoch(model, classifier, train_loader, criterion, optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
         scheduler.step()
-        optimizer.param_groups[1]["lr"] = args.classifier_lr  # keep classifier LR fixed
-        knn_acc1, knn_acc5 = knn_accuracy(model, knn_train_feats, knn_train_labels, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
+        knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         epoch_time   = time.perf_counter() - t0
 
