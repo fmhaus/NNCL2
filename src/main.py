@@ -281,7 +281,7 @@ def parse_args():
     p.add_argument("--no-projector",       action="store_true",
                    help="Disable the projection head (apply loss directly on backbone features).")
     p.add_argument("--feature-transform",  default=None,
-                   choices=["relu", "softmax", "L1_norm"],
+                   choices=["relu", "softmax", "L1_norm", "relu_norm"],
                    help="Non-negative transform applied to backbone features before projector and downstream tasks.")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")

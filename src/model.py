@@ -30,7 +30,7 @@ class SimCLRModel(nn.Module):
         proj_hidden: int = 512,
         proj_dim: int = 128,
         image_size: int = 224,
-        feature_transform: None | Literal["relu", "simplex_proj", "softmax", "L1_norm"] = None,
+        feature_transform: None | Literal["relu", "simplex_proj", "softmax", "L1_norm", "relu_norm"] = None,
         use_projector: bool = True
     ):
         super().__init__()
@@ -53,6 +53,8 @@ class SimCLRModel(nn.Module):
             self.feature_transform = nn.Softmax(dim=-1)
         elif feature_transform == "L1_norm":
             self.feature_transform = ShiftL1Norm()
+        elif feature_transform == "relu_norm":
+            self.feature_transform = ReluNorm()
             
 
 
@@ -88,7 +90,12 @@ class ReluGeluGrad(nn.Module):
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(x).detach() + F.gelu(x) - F.gelu(x).detach()
-    
+
+class ReluNorm(ReluGeluGrad):
+    """Relu (with gelu grad) and normalized (L1) to simplex plane"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = super().forward(x)
+        return x / x.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
 class LinearClassifier(nn.Module):
