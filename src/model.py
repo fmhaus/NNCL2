@@ -73,9 +73,13 @@ class SimCLRModel(nn.Module):
         """Returns projected embeddings — used for the SSL contrastive loss."""
         return self.projector(self.encode(x))
 
+    def backbone_raw(self, x: torch.Tensor) -> torch.Tensor:
+        """Backbone output before feature_transform. Shape: (B, 512)."""
+        return self.backbone(x).flatten(1)
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns backbone embeddings (512-dim) — used for downstream evaluation."""
-        return self.feature_transform(self.backbone(x).flatten(1))
+        """Returns backbone embeddings after feature_transform. Shape: (B, 512)."""
+        return self.feature_transform(self.backbone_raw(x))
 
 
 class ShiftL1Norm(nn.Module):

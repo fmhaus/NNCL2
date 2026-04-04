@@ -91,7 +91,8 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         _grad_proj_out = []
 
         with autocast:
-            feat1    = model.encode(view1)
+            raw1     = model.backbone_raw(view1)
+            feat1    = model.feature_transform(raw1)
             feat2    = model.encode(view2)
             proj_out = model.projector(feat1)
             nce_loss = criterion(proj_out, model.projector(feat2))
@@ -102,11 +103,9 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
             loss     = nce_loss + cls_loss
 
         # Three gradient positions: loss→projector, projector→feature_transform, feature_transform→backbone
-        backbone_hook  = model.backbone.register_full_backward_hook(
-            lambda _m, _gi, go: _grad_backbone.append(go[0].norm().item())
-        )
-        feat_hook      = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
-        proj_out_hook  = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
+        raw1_hook     = raw1.register_hook(lambda g: _grad_backbone.append(g.norm().item()))
+        feat_hook     = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
+        proj_out_hook = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -119,7 +118,7 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
             
         scheduler.step()
 
-        backbone_hook.remove()
+        raw1_hook.remove()
         feat_hook.remove()
         proj_out_hook.remove()
 
