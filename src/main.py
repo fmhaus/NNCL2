@@ -13,13 +13,7 @@ from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp.grad_scaler import GradScaler
 
-from dataset import (
-    CIFAR100_NORMALIZE,
-    IMAGENET_NORMALIZE,
-    get_cifar100_loaders,
-    get_tinyimagenet_loaders,
-    get_eval_loader,
-)
+from dataset import load_dataset
 from logger import TrainingLogger
 from losses import NTXentLoss
 from model import SimCLRModel, LinearClassifier
@@ -46,12 +40,12 @@ def make_scaler(precision: str, device: torch.device) -> GradScaler | None:
     return None
 
 
-def make_scheduler(optimizer, max_epochs: int, warmup_epochs: int):
-    if warmup_epochs <= 0:
-        return CosineAnnealingLR(optimizer, T_max=max_epochs)
-    warmup = LinearLR(optimizer, start_factor=1e-4, end_factor=1.0, total_iters=warmup_epochs)
-    cosine = CosineAnnealingLR(optimizer, T_max=max_epochs - warmup_epochs)
-    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+def make_scheduler(optimizer, total_steps: int, warmup_steps: int):
+    if warmup_steps <= 0:
+        return CosineAnnealingLR(optimizer, T_max=total_steps)
+    warmup = LinearLR(optimizer, start_factor=1e-4, end_factor=1.0, total_iters=warmup_steps)
+    cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +72,7 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     classifier.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
@@ -109,6 +103,7 @@ def train_epoch(model, classifier, loader, criterion, optimizer, device, autocas
         else:
             loss.backward()
             optimizer.step()
+        scheduler.step()
 
         acc1, acc5 = _topk_accuracy(logits1.detach(), labels)
         b          = labels.size(0)
@@ -251,7 +246,7 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim",    default=512,        type=int)
+    p.add_argument("--proj-hidden-dim",    default=2048,        type=int)
     p.add_argument("--proj-output-dim",    default=128,        type=int)
     p.add_argument("--no-projector",       action="store_true",
                    help="Disable the projection head (apply loss directly on backbone features).")
@@ -269,8 +264,8 @@ def parse_args():
 
     p.add_argument("--classifier-lr",   default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
-    p.add_argument("--temperature",     default=0.5,        type=float,
-                   help="NT-Xent temperature. Paper: 0.5 for CIFAR, 0.07 for ImageNet.")
+    p.add_argument("--temperature",     default=0.1,        type=float,
+                   help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
@@ -337,20 +332,19 @@ def main():
 
     # --- Data ---
     if args.dataset == "cifar100":
-        image_size, normalize, num_classes = 32, CIFAR100_NORMALIZE, 100
-        train_loader, _ = get_cifar100_loaders(args.batch_size, args.data_root, args.num_workers, args.method)
+        image_size, num_classes = 32, 100
     else:
-        image_size, normalize, num_classes = 64, IMAGENET_NORMALIZE, 200
-        train_loader, _ = get_tinyimagenet_loaders(args.batch_size, args.num_workers, args.method)
+        image_size, num_classes = 64, 200
 
-    if args.dataset == "cifar100":
-        from torchvision import datasets as tv_datasets
-        knn_train = get_eval_loader(tv_datasets.CIFAR100(args.data_root, train=True,  download=True, transform=None), args.batch_size, normalize, image_size, args.num_workers)
-        knn_val   = get_eval_loader(tv_datasets.CIFAR100(args.data_root, train=False, download=True, transform=None), args.batch_size, normalize, image_size, args.num_workers)
-    else:
-        from dataset import TinyImageNetDataset
-        knn_train = get_eval_loader(TinyImageNetDataset("train"), args.batch_size, normalize, image_size, args.num_workers)
-        knn_val   = get_eval_loader(TinyImageNetDataset("valid"), args.batch_size, normalize, image_size, args.num_workers)
+    def get_data_loader(two_view: bool, augment, train: bool):
+        return load_dataset(
+            args.dataset, two_view=two_view, augment=augment, train=train,
+            batch_size=args.batch_size, num_workers=args.num_workers, data_root=args.data_root,
+        )
+
+    train_loader = get_data_loader(two_view=True,  augment=args.method, train=True)
+    knn_train    = get_data_loader(two_view=False, augment=None,        train=True)
+    knn_val      = get_data_loader(two_view=False, augment=None,        train=False)
 
     # --- Model, classifier, loss, optimiser ---
     model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
@@ -374,7 +368,8 @@ def main():
         ],
         lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
     )
-    scheduler = make_scheduler(optimizer, args.max_epochs, args.warmup_epochs)
+    steps_per_epoch = len(train_loader)
+    scheduler = make_scheduler(optimizer, args.max_epochs * steps_per_epoch, args.warmup_epochs * steps_per_epoch)
     autocast  = make_autocast(args.precision, device)
     scaler    = make_scaler(args.precision, device)
 
@@ -393,8 +388,7 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0           = time.perf_counter()
-        train_m    = train_epoch(model, classifier, train_loader, criterion, optimizer, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
-        scheduler.step()
+        train_m    = train_epoch(model, classifier, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
         knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
         epoch_time   = time.perf_counter() - t0
