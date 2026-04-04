@@ -102,8 +102,8 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
             loss     = nce_loss + cls_loss
 
         # Three gradient positions: loss→projector, projector→feature_transform, feature_transform→backbone
-        backbone_hook  = model.feature_transform.register_backward_hook(
-            lambda _m, gi, _go: _grad_backbone.append(gi[0].norm().item())
+        backbone_hook  = model.backbone.register_full_backward_hook(
+            lambda _m, _gi, go: _grad_backbone.append(go[0].norm().item())
         )
         feat_hook      = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
         proj_out_hook  = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
