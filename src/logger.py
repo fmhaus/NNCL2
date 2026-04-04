@@ -1,7 +1,6 @@
 """Training logger: hparams, metrics CSV, checkpoints, console output, openbayestool."""
 
 import json
-import time
 from pathlib import Path
 
 import pandas as pd
@@ -22,14 +21,18 @@ _METRIC_KEYS = [
     "train_class_loss",
     "train_acc1_epoch",
     "train_acc5_epoch",
+    "grad_backbone_norm",
+    "grad_feat_norm",
+    "grad_proj_out_norm",
     "val_knn_acc1",
     "val_knn_acc5",
     "val_loss",
     "val_acc1",
     "val_acc5",
+    "feat_l1",
+    "feat_l2",
     "lr",
     "epoch_time_s",
-    "wall_time",
 ]
 
 
@@ -54,7 +57,6 @@ class TrainingLogger:
 
         self._rows: list[dict] = []
         self._last_ckpt: Path | None = None
-        self._wall_start = time.perf_counter()
 
         (save_dir / "hparams.json").write_text(json.dumps(vars(args), indent=2))
 
@@ -72,8 +74,7 @@ class TrainingLogger:
 
     def log(self, epoch: int, metrics: dict[str, float]) -> None:
         """Log metrics for one epoch — console + metrics.csv + openbayestool."""
-        wall = time.perf_counter() - self._wall_start
-        row  = {"epoch": epoch, "wall_time": round(wall, 2), **metrics}
+        row  = {"epoch": epoch, **metrics}
         self._rows.append(row)
 
         pd.DataFrame(self._rows).to_csv(self.save_dir / "metrics.csv", index=False)
@@ -86,7 +87,6 @@ class TrainingLogger:
             print(" | ".join(parts))
 
         if self.use_openbayestool:
-            log_metric("wall_time", round(wall, 2))
             for key, value in metrics.items():
                 log_metric(key, value)
 

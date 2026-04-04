@@ -79,21 +79,34 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
 
     sum_nce = sum_cls = 0.0
     sum_acc1 = sum_acc5 = n_samples = 0
+    sum_grad_backbone = sum_grad_feat = sum_grad_proj_out = 0.0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
         view1  = view1.to(device, non_blocking=is_cuda)
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
+        _grad_backbone = []
+        _grad_feat     = []
+        _grad_proj_out = []
+
         with autocast:
             feat1    = model.encode(view1)
             feat2    = model.encode(view2)
-            nce_loss = criterion(model.projector(feat1), model.projector(feat2))
+            proj_out = model.projector(feat1)
+            nce_loss = criterion(proj_out, model.projector(feat2))
             # Classifier on both views averaged — 2× gradient signal per step
             logits1  = classifier(feat1.detach())
             logits2  = classifier(feat2.detach())
             cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
             loss     = nce_loss + cls_loss
+
+        # Three gradient positions: loss→projector, projector→feature_transform, feature_transform→backbone
+        backbone_hook  = model.feature_transform.register_backward_hook(
+            lambda _m, gi, _go: _grad_backbone.append(gi[0].norm().item())
+        )
+        feat_hook      = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
+        proj_out_hook  = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -103,7 +116,16 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         else:
             loss.backward()
             optimizer.step()
+            
         scheduler.step()
+
+        backbone_hook.remove()
+        feat_hook.remove()
+        proj_out_hook.remove()
+
+        sum_grad_backbone += _grad_backbone[0] if _grad_backbone else 0.0
+        sum_grad_feat     += _grad_feat[0]     if _grad_feat     else 0.0
+        sum_grad_proj_out += _grad_proj_out[0] if _grad_proj_out else 0.0
 
         acc1, acc5 = _topk_accuracy(logits1.detach(), labels)
         b          = labels.size(0)
@@ -115,8 +137,11 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
 
     n = len(loader)
     return {
-        "train_nce_loss":   sum_nce  / n,
-        "train_class_loss": sum_cls  / n,
+        "train_nce_loss":      sum_nce          / n,
+        "train_class_loss":    sum_cls          / n,
+        "grad_backbone_norm":  sum_grad_backbone / n,
+        "grad_feat_norm":  sum_grad_feat     / n,
+        "grad_proj_out_norm":  sum_grad_proj_out / n,
         "train_acc1_epoch": sum_acc1 / n_samples,
         "train_acc5_epoch": sum_acc5 / n_samples,
     }
@@ -132,25 +157,30 @@ def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, e
     classifier.eval()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    sum_loss = sum_acc1 = sum_acc5 = n_samples = 0
+    sum_loss = sum_acc1 = sum_acc5 = sum_l1 = sum_l2 = n_samples = 0
 
     for images, labels in _wrap_tqdm(loader, use_tqdm, desc=f"val [epoch {epoch}]", leave=False):
         images = images.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        logits    = classifier(model.encode(images))
+        feats     = model.encode(images)
+        logits    = classifier(feats)
         sum_loss += F.cross_entropy(logits, labels).item()
 
         acc1, acc5 = _topk_accuracy(logits, labels)
         b          = labels.size(0)
         sum_acc1  += acc1 * b
         sum_acc5  += acc5 * b
+        sum_l1    += feats.norm(p=1, dim=1).mean().item() * b
+        sum_l2    += feats.norm(p=2, dim=1).mean().item() * b
         n_samples += b
 
     return {
         "val_loss": sum_loss / len(loader),
         "val_acc1": sum_acc1 / n_samples,
         "val_acc5": sum_acc5 / n_samples,
+        "feat_l1":  sum_l1  / n_samples,
+        "feat_l2":  sum_l2  / n_samples,
     }
 
 
@@ -400,9 +430,14 @@ def main():
             "train_acc5_epoch": train_m["train_acc5_epoch"],
             "val_knn_acc1":     knn_acc1,
             "val_knn_acc5":     knn_acc5,
+            "grad_backbone_norm":  train_m["grad_backbone_norm"],
+            "grad_feat_norm":      train_m["grad_feat_norm"],
+            "grad_proj_out_norm":  train_m["grad_proj_out_norm"],
             "val_loss":         val_m["val_loss"],
             "val_acc1":         val_m["val_acc1"],
             "val_acc5":         val_m["val_acc5"],
+            "feat_l1":          val_m["feat_l1"],
+            "feat_l2":          val_m["feat_l2"],
             "lr":               scheduler.get_last_lr()[0],
             "epoch_time_s":     epoch_time,
         }
