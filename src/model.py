@@ -50,7 +50,7 @@ class SimCLRModel(nn.Module):
         elif feature_transform == "relu":
             self.feature_transform = ReluGeluGrad()
         elif feature_transform == "softmax":
-            self.feature_transform = nn.Softmax()
+            self.feature_transform = nn.Softmax(dim=-1)
         elif feature_transform == "L1_norm":
             self.feature_transform = ShiftL1Norm()
             
