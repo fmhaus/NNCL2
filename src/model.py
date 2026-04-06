@@ -43,7 +43,9 @@ class SimCLRModel(nn.Module):
             base.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
             base.maxpool = nn.Identity() # type: ignore
 
-        self.backbone = nn.Sequential(*list(base.children())[:-1])  # (B, 512, 1, 1)
+        # Remove last fc layer
+        base.fc = nn.Identity()  # type: ignore
+        self.backbone = base
 
         if feature_transform is None:
             self.feature_transform = nn.Identity()
@@ -75,7 +77,7 @@ class SimCLRModel(nn.Module):
 
     def backbone_raw(self, x: torch.Tensor) -> torch.Tensor:
         """Backbone output before feature_transform. Shape: (B, 512)."""
-        return self.backbone(x).flatten(1)
+        return self.backbone(x)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Returns backbone embeddings after feature_transform. Shape: (B, 512)."""

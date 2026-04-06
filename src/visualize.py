@@ -1,67 +1,82 @@
-"""Visualize metrics.csv produced by a training run."""
+"""Visualize metrics.csv for one or more training runs."""
 
 import argparse
 from pathlib import Path
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+import matplotlib.lines as mlines
+
+# Line styles cycled per run; colors are per metric series (shared across runs).
+_STYLES = ["-", "--", ":", "-."]
+_COLORS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
 
-def plot(csv_path: Path, out_path: Path | None = None) -> None:
-    df = pd.read_csv(csv_path)
-    epochs = df["epoch"]
+def _color(i: int) -> str:
+    return _COLORS[i % len(_COLORS)]
 
-    fig = plt.figure(figsize=(14, 10))
-    fig.suptitle(csv_path.parent.name, fontsize=13, fontweight="bold")
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
 
-    # --- Loss ---
-    ax = fig.add_subplot(gs[0, 0])
-    ax.plot(epochs, df["train_nce_loss"],   label="NCE (train)")
-    ax.plot(epochs, df["train_class_loss"], label="Cls (train)")
-    ax.plot(epochs, df["val_loss"],         label="Cls (val)", linestyle="--")
-    ax.set_title("Loss")
-    ax.set_xlabel("Epoch")
-    ax.legend(fontsize=8)
+def _style(run_idx: int) -> str:
+    return _STYLES[run_idx % len(_STYLES)]
 
-    # --- Top-1 accuracy ---
-    ax = fig.add_subplot(gs[0, 1])
-    ax.plot(epochs, df["train_acc1_epoch"], label="Linear (train)")
-    ax.plot(epochs, df["val_acc1"],         label="Linear (val)", linestyle="--")
-    ax.plot(epochs, df["val_knn_acc1"],     label="kNN (val)",    linestyle=":")
-    ax.set_title("Top-1 Accuracy")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.legend(fontsize=8)
 
-    # --- Top-5 accuracy ---
-    ax = fig.add_subplot(gs[0, 2])
-    ax.plot(epochs, df["train_acc5_epoch"], label="Linear (train)")
-    ax.plot(epochs, df["val_acc5"],         label="Linear (val)", linestyle="--")
-    ax.plot(epochs, df["val_knn_acc5"],     label="kNN (val)",    linestyle=":")
-    ax.set_title("Top-5 Accuracy")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.legend(fontsize=8)
+def _plot_series(ax, runs: list[tuple[str, pd.DataFrame]], columns: list[str], labels: list[str]) -> None:
+    """Plot multiple metric columns across multiple runs.
 
-    # --- Learning rate ---
-    ax = fig.add_subplot(gs[1, 0])
-    ax.plot(epochs, df["lr"])
-    ax.set_title("Learning Rate")
-    ax.set_xlabel("Epoch")
+    Each column gets a fixed color; each run gets a fixed linestyle.
+    """
+    for col_idx, (col, label) in enumerate(zip(columns, labels)):
+        for run_idx, (name, df) in enumerate(runs):
+            if col not in df.columns:
+                continue
+            ax.plot(
+                df["epoch"], df[col],
+                color=_color(col_idx),
+                linestyle=_style(run_idx),
+                linewidth=1.4,
+                label=f"{label} ({name})" if len(runs) == 1 else None,
+            )
 
-    # --- Epoch time ---
-    ax = fig.add_subplot(gs[1, 1])
-    ax.plot(epochs, df["epoch_time_s"])
-    ax.set_title("Epoch Time (s)")
-    ax.set_xlabel("Epoch")
 
-    # --- Wall time ---
-    ax = fig.add_subplot(gs[1, 2])
-    ax.plot(epochs, df["wall_time"] / 3600)
-    ax.set_title("Wall Time (h)")
-    ax.set_xlabel("Epoch")
+def _add_run_legend(ax, runs: list[tuple[str, pd.DataFrame]]) -> None:
+    """Add a run→linestyle legend inside a given axes."""
+    handles = [
+        mlines.Line2D([], [], color="black", linestyle=_style(i), linewidth=1.4, label=name)
+        for i, (name, _) in enumerate(runs)
+    ]
+    ax.legend(handles=handles, title="Run", fontsize=7, title_fontsize=7, loc="best")
+
+
+def plot(runs: list[tuple[str, pd.DataFrame]], out_path: Path | None = None) -> None:
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    fig.suptitle(" · ".join(n for n, _ in runs), fontsize=11, fontweight="bold")
+    axes = axes.flatten()
+
+    panels = [
+        # (title, columns, labels)
+        ("Loss",             ["train_nce_loss", "train_class_loss", "val_loss"],      ["NCE (train)", "Cls (train)", "Cls (val)"]),
+        ("Top-1 Accuracy",   ["train_acc1_epoch", "val_acc1", "val_knn_acc1"],        ["Linear (train)", "Linear (val)", "kNN (val)"]),
+        ("Top-5 Accuracy",   ["train_acc5_epoch", "val_acc5", "val_knn_acc5"],        ["Linear (train)", "Linear (val)", "kNN (val)"]),
+        ("Feat L1 norm",     ["feat_l1"],                                              ["L1"]),
+        ("Grad: backbone",   ["grad_backbone_norm"],                                   ["backbone"]),
+        ("Grad: feat",       ["grad_feat_norm"],                                       ["feat"]),
+        ("Grad: proj out",   ["grad_proj_out_norm"],                                   ["proj_out"]),
+        ("Feat L2 norm",     ["feat_l2"],                                              ["L2"]),
+    ]
+
+    for ax, (title, columns, labels) in zip(axes, panels):
+        _plot_series(ax, runs, columns, labels)
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("Epoch", fontsize=8)
+        ax.tick_params(labelsize=7)
+        if len(runs) == 1:
+            ax.legend(fontsize=7)
+
+    if len(runs) > 1:
+        # Run→style legend in the last panel (feat_l2)
+        _add_run_legend(axes[-1], runs)
+
+    plt.tight_layout()
 
     if out_path is not None:
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -70,21 +85,21 @@ def plot(csv_path: Path, out_path: Path | None = None) -> None:
         plt.show()
 
 
-def main():
-    p = argparse.ArgumentParser(description="Plot metrics.csv from a training run.")
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--name", help="Run name — resolves to saves/<name>/metrics.csv.")
-    group.add_argument("--run",  help="Path to run directory or directly to metrics.csv.")
-    p.add_argument("--out", default=None, help="Save figure to this path instead of showing it.")
+def main() -> None:
+    p = argparse.ArgumentParser(description="Visualize metrics from one or more training runs.")
+    p.add_argument("--names", nargs="+", required=True,
+                   help="One or more run names. Resolves to saves/<name>/metrics.csv.")
+    p.add_argument("--out", default=None, help="Save figure to this path instead of showing.")
     args = p.parse_args()
 
-    path = Path("saves") / args.name if args.name else Path(args.run)
-    csv_path = path if path.suffix == ".csv" else path / "metrics.csv"
-    if not csv_path.exists():
-        raise SystemExit(f"metrics.csv not found at '{csv_path}'.")
+    runs: list[tuple[str, pd.DataFrame]] = []
+    for name in args.names:
+        csv = Path("saves") / name / "metrics.csv"
+        if not csv.exists():
+            raise SystemExit(f"metrics.csv not found at '{csv}'.")
+        runs.append((name, pd.read_csv(csv)))
 
-    out_path = Path(args.out) if args.out else None
-    plot(csv_path, out_path)
+    plot(runs, Path(args.out) if args.out else None)
 
 
 if __name__ == "__main__":
