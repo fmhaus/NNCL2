@@ -1,9 +1,4 @@
-"""Generate architecture diagram for the non-negative contrastive variant.
-
-Flow:
-  Main SSL chain : Image → Aug → Backbone → MLP → ReLU Transform → NT-Xent
-  Classifier     : Backbone → Linear Classifier → CE loss   (detached)
-"""
+"""Generate a SimCLR architecture diagram."""
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches  # noqa: F401 (used in box())
@@ -47,63 +42,57 @@ C_FEAT = "#7b4f9e"
 C_PROJ = "#c05c35"
 C_LOSS = "#b5444f"
 C_CLS  = "#5a7a3a"
-C_EVAL = "#7a6a3a"
 
 BW, BH = 0.10, 0.16
-GAP    = 0.065
-STEP   = BW + GAP
+GAP    = 0.065          # gap between box edges
+STEP   = BW + GAP       # center-to-center distance
 
-CY  = 0.62   # main chain y
-CLY = 0.25   # classifier y
+CY  = 0.62             # main chain y
+CLY = 0.25             # classifier y
 
-# Main chain: Image, Aug, Backbone, MLP, ReLU Transform, NT-Xent
+# Main chain x-centers
 x0 = 0.07
 XS = [x0 + i * STEP for i in range(6)]
+# XS: Image, Aug, Backbone, Transform, Projector, NT-Xent
 
 labels_main = [
-    ("Image x",    None,          C_IMG),
-    ("Aug",        "SimCLR ×2",   C_AUG),
-    ("Backbone f", "ResNet18",    C_BACK),
-    ("MLP",        "proj + BN",   C_PROJ),
-    ("Transform",  "ReLU",        C_FEAT),
-    ("NT-Xent",    "loss",        C_LOSS),
+    ("Sample image",    None,               C_IMG),
+    ("Augmentation",        "2 x",        C_AUG),
+    ("Backbone", "ResNet18",            C_BACK),
+    ("Transform/Normalization",  "ReLU / L1_Norm",       C_FEAT),
+    ("Projector","MLP",                 C_PROJ),
+    ("NT-Xent", "loss for SimCLR",              C_LOSS),
 ]
 
-for x, (label, sub, color) in zip(XS[:6], labels_main):
+for x, (label, sub, color) in zip(XS, labels_main):
     box(ax, x, CY, BW, BH, label, sub, color)
 
+# Arrows between main chain boxes
 for i in range(len(XS) - 1):
     arrow(ax, XS[i] + BW / 2, CY, XS[i + 1] - BW / 2, CY)
 
-# Dimension label
-ax.text((XS[2] + XS[3]) / 2, CY + BH / 2 + 0.07,
-        "h  (512-d)", ha="center", fontsize=7.5, color="#555555", style="italic")
-
-# Shared weights note under backbone
-ax.text(XS[2], CY - BH / 2 - 0.08,
-        "shared weights\nacross views",
-        ha="center", fontsize=7, color="#4477aa", style="italic")
-
-# ── Classifier branch — branches off directly from Backbone ──────────────────
-arrow(ax, XS[2], CY - BH / 2, XS[2], CLY + BH / 2, dashed=True)
-ax.text(XS[2] + 0.018, (CY - BH / 2 + CLY + BH / 2) / 2,
+# ── Online classifier branch ─────────────────────────────────────────────────
+# Dashed arrow down from Transform
+arrow(ax, XS[3], CY - BH / 2, XS[3], CLY + BH / 2, dashed=True)
+ax.text(XS[3] + 0.018, (CY - BH / 2 + CLY + BH / 2) / 2,
         "detach", fontsize=7, color="#555555", style="italic")
 
-box(ax, XS[2], CLY, BW, BH, "Classifier", "accuracy eval", color=C_CLS)
-box(ax, XS[3], CLY, BW, BH, "CE loss", color=C_LOSS)
-arrow(ax, XS[2] + BW / 2, CLY, XS[3] - BW / 2, CLY)
+# Classifier box aligned under Transform
+box(ax, XS[3], CLY, BW, BH, "Classifier", "Linear probing for eval", color=C_CLS)
 
-# Eval block below Transform (XS[4])
-arrow(ax, XS[4], CY - BH / 2, XS[4], CLY + BH / 2, dashed=True)
-box(ax, XS[4], CLY, BW, BH, "Eval",
-    "sparsity · ortho\n· disentangle", color=C_EVAL)
+# CE loss box aligned under Projector
+box(ax, XS[4], CLY, BW, BH, "Cross Entropy loss", color=C_LOSS)
+
+# Arrow from Classifier to CE loss
+arrow(ax, XS[3] + BW / 2, CLY, XS[4] - BW / 2, CLY)
 
 # ── Title ────────────────────────────────────────────────────────────────────
-ax.text(0.5, 0.97, "NNCL implementation",
+ax.text(0.5, 0.97, "SimCLR — SSL Pre-training Architecture",
         ha="center", va="top", fontsize=13, fontweight="bold", color="#111111")
 
+
 plt.tight_layout()
-plt.savefig("simclr_diagram_variant.png", dpi=180, bbox_inches="tight",
+plt.savefig("simclr_diagram.png", dpi=180, bbox_inches="tight",
             facecolor=fig.get_facecolor())
-print("Saved to simclr_diagram_variant.png")
+print("Saved to simclr_diagram.png")
 plt.show()

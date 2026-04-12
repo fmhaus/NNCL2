@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp.grad_scaler import GradScaler
 
 from dataset import load_dataset
+from evaluator import evaluate_features
 from logger import TrainingLogger
 from losses import NTXentLoss
 from model import SimCLRModel, LinearClassifier
@@ -72,40 +73,42 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifiers, feature_names, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
-    classifier.train()
+    for clf in classifiers:
+        clf.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    sum_nce = sum_cls = 0.0
-    sum_acc1 = sum_acc5 = n_samples = 0
-    sum_grad_backbone = sum_grad_feat = sum_grad_proj_out = 0.0
+    n_levels  = len(feature_names)
+    sum_nce   = sum_cls = 0.0
+    sum_acc1  = [0.0] * n_levels
+    sum_grad  = [0.0] * n_levels
+    n_samples = 0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
         view1  = view1.to(device, non_blocking=is_cuda)
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        _grad_backbone = []
-        _grad_feat     = []
-        _grad_proj_out = []
+        _grads: list[list[float]] = [[] for _ in feature_names]
 
         with autocast:
-            raw1     = model.backbone_raw(view1)
-            feat1    = model.feature_transform(raw1)
-            feat2    = model.encode(view2)
-            proj_out = model.projector(feat1)
-            nce_loss = criterion(proj_out, model.projector(feat2))
+            feats1   = model.encode_all(view1)
+            feats2   = model.encode_all(view2)
+            nce_loss = criterion(feats1[-1], feats2[-1])
             # Classifier on both views averaged — 2× gradient signal per step
-            logits1  = classifier(feat1.detach())
-            logits2  = classifier(feat2.detach())
-            cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
-            loss     = nce_loss + cls_loss
+            logits1  = [clf(f.detach()) for clf, f in zip(classifiers, feats1)]
+            logits2  = [clf(f.detach()) for clf, f in zip(classifiers, feats2)]
+            cls_loss = torch.stack([
+                (F.cross_entropy(l1, labels) + F.cross_entropy(l2, labels)) / 2
+                for l1, l2 in zip(logits1, logits2)
+            ]).mean()
+            loss = nce_loss + cls_loss
 
-        # Three gradient positions: loss→projector, projector→feature_transform, feature_transform→backbone
-        raw1_hook     = raw1.register_hook(lambda g: _grad_backbone.append(g.norm().item()))
-        feat_hook     = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
-        proj_out_hook = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
+        hooks = [
+            f.register_hook(lambda g, i=i: _grads[i].append(g.norm().item()))
+            for i, f in enumerate(feats1)
+        ]
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -115,35 +118,29 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         else:
             loss.backward()
             optimizer.step()
-            
+
         scheduler.step()
 
-        raw1_hook.remove()
-        feat_hook.remove()
-        proj_out_hook.remove()
+        for hook in hooks:
+            hook.remove()
 
-        sum_grad_backbone += _grad_backbone[0] if _grad_backbone else 0.0
-        sum_grad_feat     += _grad_feat[0]     if _grad_feat     else 0.0
-        sum_grad_proj_out += _grad_proj_out[0] if _grad_proj_out else 0.0
-
-        acc1, acc5 = _topk_accuracy(logits1.detach(), labels)
-        b          = labels.size(0)
-        sum_nce   += nce_loss.item()
-        sum_cls   += cls_loss.item()
-        sum_acc1  += acc1 * b
-        sum_acc5  += acc5 * b
+        b = labels.size(0)
+        sum_nce += nce_loss.item()
+        sum_cls += cls_loss.item()
+        for i, l1 in enumerate(logits1):
+            sum_acc1[i] += _topk_accuracy(l1.detach(), labels, topk=(1,))[0] * b
+            sum_grad[i]  += _grads[i][0] if _grads[i] else 0.0
         n_samples += b
 
     n = len(loader)
-    return {
-        "train_nce_loss":      sum_nce          / n,
-        "train_class_loss":    sum_cls          / n,
-        "grad_backbone_norm":  sum_grad_backbone / n,
-        "grad_feat_norm":  sum_grad_feat     / n,
-        "grad_proj_out_norm":  sum_grad_proj_out / n,
-        "train_acc1_epoch": sum_acc1 / n_samples,
-        "train_acc5_epoch": sum_acc5 / n_samples,
+    result: dict = {
+        "train_nce_loss": sum_nce / n,
+        "train_cls_loss": sum_cls / n,
     }
+    for i, name in enumerate(feature_names):
+        result[f"{name}_grad"]        = sum_grad[i]  / n
+        result[f"{name}_train_acc1"]  = sum_acc1[i]  / n_samples
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -151,106 +148,42 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, epoch: int = 0) -> dict:
-    model.eval()
-    classifier.eval()
-    is_cuda = next(model.parameters()).device.type == "cuda"
-
-    sum_loss = sum_acc1 = sum_acc5 = sum_l1 = sum_l2 = n_samples = 0
-
-    for images, labels in _wrap_tqdm(loader, use_tqdm, desc=f"val [epoch {epoch}]", leave=False):
-        images = images.to(device, non_blocking=is_cuda)
-        labels = labels.to(device, non_blocking=is_cuda)
-
-        feats     = model.encode(images)
-        logits    = classifier(feats)
-        sum_loss += F.cross_entropy(logits, labels).item()
-
-        acc1, acc5 = _topk_accuracy(logits, labels)
-        b          = labels.size(0)
-        sum_acc1  += acc1 * b
-        sum_acc5  += acc5 * b
-        sum_l1    += feats.norm(p=1, dim=1).mean().item() * b
-        sum_l2    += feats.norm(p=2, dim=1).mean().item() * b
-        n_samples += b
-
-    return {
-        "val_loss": sum_loss / len(loader),
-        "val_acc1": sum_acc1 / n_samples,
-        "val_acc5": sum_acc5 / n_samples,
-        "feat_l1":  sum_l1  / n_samples,
-        "feat_l2":  sum_l2  / n_samples,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Evaluation — kNN top-1 and top-5
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def knn_accuracy(
-    model, train_loader, val_loader, device,
-    k: int = 20, temperature: float = 0.07, use_tqdm: bool = False, epoch: int = 0,
-) -> tuple[float, float]:
-    """Returns (top-1 kNN acc, top-5 kNN acc)."""
+def extract_all_features(model, feature_names, loader, device, use_tqdm: bool = False, desc: str = "") -> tuple[list[list], list]:
+    """Returns (all_feats, labels) where all_feats[level] is a list of tensors."""
     model.eval()
     is_cuda = next(model.parameters()).device.type == "cuda"
-
-    def extract(loader, desc):
-        feats, labels = [], []
-        for images, targets in _wrap_tqdm(loader, use_tqdm, desc=desc, leave=False):
-            feats.append(model.encode(images.to(device, non_blocking=is_cuda)))
-            labels.append(targets.to(device, non_blocking=is_cuda))
-        return torch.cat(feats), torch.cat(labels)
-
-    train_feats, train_labels = extract(train_loader, f"knn-train [epoch {epoch}]")
-    val_feats,   val_labels   = extract(val_loader,   f"knn-val   [epoch {epoch}]")
-
-    train_feats = nn.functional.normalize(train_feats, dim=1)
-    val_feats   = nn.functional.normalize(val_feats,   dim=1)
-
-    num_classes = int(train_labels.max().item()) + 1
-    correct1 = correct5 = 0
-
-    for vf, vl in zip(val_feats.split(512), val_labels.split(512)):
-        top_k      = (vf @ train_feats.T / temperature).topk(k, dim=1).indices  # (chunk, k)
-        knn_labels = train_labels[top_k]                                         # (chunk, k)
-
-        # Aggregate class votes, then rank
-        votes = torch.zeros(vl.size(0), num_classes, device=device)
-        votes.scatter_add_(1, knn_labels, torch.ones_like(knn_labels, dtype=torch.float))
-        _, top5 = votes.topk(5, dim=1)                                           # (chunk, 5)
-
-        correct1 += (top5[:, 0] == vl).sum().item()
-        correct5 += (top5 == vl.unsqueeze(1)).any(dim=1).sum().item()
-
-    total = len(val_labels)
-    return correct1 / total, correct5 / total
+    all_feats: list[list] = [[] for _ in feature_names]
+    labels = []
+    for images, targets in _wrap_tqdm(loader, use_tqdm, desc=desc, leave=False):
+        for i, f in enumerate(model.encode_all(images.to(device, non_blocking=is_cuda))):
+            all_feats[i].append(f)
+        labels.append(targets.to(device, non_blocking=is_cuda))
+    return all_feats, labels
 
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _checkpoint_state(epoch, model, classifier, optimizer, scheduler, scaler, args) -> dict:
+def _checkpoint_state(epoch, model, classifiers, optimizer, scheduler, scaler, args) -> dict:
     state = {
-        "epoch":      epoch,
-        "model":      model.state_dict(),
-        "classifier": classifier.state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "scheduler":  scheduler.state_dict(),
-        "args":       vars(args),
+        "epoch":       epoch,
+        "model":       model.state_dict(),
+        "classifiers": classifiers.state_dict(),
+        "optimizer":   optimizer.state_dict(),
+        "scheduler":   scheduler.state_dict(),
+        "args":        vars(args),
     }
     if scaler is not None:
         state["scaler"] = scaler.state_dict()
     return state
 
 
-def load_checkpoint(path, model, classifier, optimizer, scheduler, scaler) -> int:
+def load_checkpoint(path, model, classifiers, optimizer, scheduler, scaler) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
-    if "classifier" in ckpt:
-        classifier.load_state_dict(ckpt["classifier"])
+    if "classifiers" in ckpt:
+        classifiers.load_state_dict(ckpt["classifiers"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
@@ -275,13 +208,12 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim",    default=2048,        type=int)
-    p.add_argument("--proj-output-dim",    default=128,        type=int)
-    p.add_argument("--no-projector",       action="store_true",
-                   help="Disable the projection head (apply loss directly on backbone features).")
-    p.add_argument("--feature-transform",  default=None,
-                   choices=["relu", "softmax", "L1_norm", "relu_norm"],
-                   help="Non-negative transform applied to backbone features before projector and downstream tasks.")
+    p.add_argument("--proj-out-dim",  default=128, type=int,
+                   help="Output dimension of the projection head.")
+    p.add_argument("--proj-layers",   default=1,   type=int,
+                   help="Hidden x→x blocks before the final compression. 0 = head only.")
+    p.add_argument("--no-projector",  action="store_true",
+                   help="Disable the projection head entirely.")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")
     p.add_argument("--max-epochs",      default=200,        type=int)
@@ -340,7 +272,7 @@ def main():
         print(f"Resuming '{args.name}' from {resume_ckpt.name}")
     else:
         if save_dir.exists():
-            raise SystemExit(f"Run '{args.name}' already exists at '{save_dir}'. Use --resume to continue it.")
+            raise SystemExit(f"Run '{args.name}' already exists at '{save_dir}'. Use --resume to continue it                                            .")
         resume_ckpt = None
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -375,9 +307,13 @@ def main():
     knn_train    = get_data_loader(two_view=False, augment=None,        train=True)
     knn_val      = get_data_loader(two_view=False, augment=None,        train=False)
 
-    # --- Model, classifier, loss, optimiser ---
-    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
-    classifier = LinearClassifier(num_classes=num_classes).to(device)
+    # --- Model, classifiers, loss, optimiser ---
+    proj_layers = None if args.no_projector else args.proj_layers
+    model       = SimCLRModel(proj_out_dim=args.proj_out_dim, proj_layers=proj_layers, image_size=image_size).to(device)
+    feature_names = model.feature_names
+    classifiers   = nn.ModuleList(
+        LinearClassifier(dim, num_classes) for dim in model.feature_dims
+    ).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
 
     # Exclude normalization from weight decay
@@ -392,8 +328,8 @@ def main():
     optimizer = SGD(
         [
             {"params": decay},
-            {"params": no_decay,                  "weight_decay": 0.0},
-            {"params": classifier.parameters(),   "weight_decay": 0.0, "lr": args.classifier_lr},
+            {"params": no_decay,                   "weight_decay": 0.0},
+            {"params": classifiers.parameters(),   "weight_decay": 0.0, "lr": args.classifier_lr},
         ],
         lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
     )
@@ -404,44 +340,40 @@ def main():
 
     start_epoch = 0
     if resume_ckpt is not None:
-        start_epoch = load_checkpoint(resume_ckpt, model, classifier, optimizer, scheduler, scaler)
+        start_epoch = load_checkpoint(resume_ckpt, model, classifiers, optimizer, scheduler, scaler)
 
     # Keep uncompiled references for state dict I/O — torch.compile wraps the
     # module and _model.state_dict() returns mangled keys.
-    model_for_ckpt      = model
-    classifier_for_ckpt = classifier
+    model_for_ckpt       = model
+    classifiers_for_ckpt = classifiers
     if args.compile:
-        model      = torch.compile(model)
-        classifier = torch.compile(classifier)
+        model = torch.compile(model)
 
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
-        t0           = time.perf_counter()
-        train_m    = train_epoch(model, classifier, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
-        knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        epoch_time   = time.perf_counter() - t0
+        t0      = time.perf_counter()
+        train_m = train_epoch(model, classifiers, feature_names, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+
+        train_all, train_labels = extract_all_features(model, feature_names, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
+        val_all,   val_labels   = extract_all_features(model, feature_names, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
+
+        val_m = {}
+        for i, name in enumerate(feature_names):
+            m = evaluate_features(train_all[i], train_labels, val_all[i], val_labels, classifiers_for_ckpt[i])
+            val_m.update({f"{name}_{k}": v for k, v in m.items()})
+
+        epoch_time = time.perf_counter() - t0
 
         metrics = {
-            "train_nce_loss":   train_m["train_nce_loss"],
-            "train_class_loss": train_m["train_class_loss"],
-            "train_acc1_epoch": train_m["train_acc1_epoch"],
-            "train_acc5_epoch": train_m["train_acc5_epoch"],
-            "val_knn_acc1":     knn_acc1,
-            "val_knn_acc5":     knn_acc5,
-            "grad_backbone_norm":  train_m["grad_backbone_norm"],
-            "grad_feat_norm":      train_m["grad_feat_norm"],
-            "grad_proj_out_norm":  train_m["grad_proj_out_norm"],
-            "val_loss":         val_m["val_loss"],
-            "val_acc1":         val_m["val_acc1"],
-            "val_acc5":         val_m["val_acc5"],
-            "feat_l1":          val_m["feat_l1"],
-            "feat_l2":          val_m["feat_l2"],
-            "lr":               scheduler.get_last_lr()[0],
-            "epoch_time_s":     epoch_time,
+            "train_nce_loss": train_m["train_nce_loss"],
+            "train_cls_loss": train_m["train_cls_loss"],
+            "lr":             scheduler.get_last_lr()[0],
+            "epoch_time_s":   epoch_time,
+            **{k: v for k, v in train_m.items() if k not in ("train_nce_loss", "train_cls_loss")},
+            **val_m,
         }
         logger.log(epoch + 1, metrics)
-        logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifier_for_ckpt, optimizer, scheduler, scaler, args))
+        logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifiers_for_ckpt, optimizer, scheduler, scaler, args))
 
     print("Training complete.")
 

@@ -81,8 +81,13 @@ def plot(runs: list[tuple[str, pd.DataFrame]], out_path: Path | None = None) -> 
     if out_path is not None:
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved to {out_path}")
-    else:
-        plt.show()
+
+    plt.show()
+
+    if out_path is None and len(runs) == 1:
+        auto_path = Path("saves") / runs[0][0] / "image.png"
+        fig.savefig(auto_path, dpi=150, bbox_inches="tight")
+        print(f"Saved to {auto_path}")
 
 
 def main() -> None:
