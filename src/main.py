@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp.grad_scaler import GradScaler
 
 from dataset import load_dataset
-from evaluator import evaluate_features
+from evaluator import evaluate_features, evaluate_features_fast
 from logger import TrainingLogger
 from losses import NTXentLoss
 from model import SimCLRModel, LinearClassifier
@@ -233,6 +233,8 @@ def parse_args():
                    help="Resume training from saves/<name>/. Overrides all args from hparams.json.")
     p.add_argument("--compile",          action="store_true",
                    help="torch.compile the model and classifier.")
+    p.add_argument("--eval-freq",        default=10,         type=int,
+                   help="Run full evaluation (MIG, ortho, sparsity) every N epochs. KNN and classifier run every epoch.")
     p.add_argument("--console-log",     action="store_true",
                    help="Print metrics to console after every epoch.")
     p.add_argument("--tqdm",            action="store_true",
@@ -357,9 +359,12 @@ def main():
         train_all, train_labels = extract_all_features(model, feature_names, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
         val_all,   val_labels   = extract_all_features(model, feature_names, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
 
+        full_eval = (epoch + 1) % args.eval_freq == 0 or (epoch + 1) == args.max_epochs
+        eval_fn   = evaluate_features if full_eval else evaluate_features_fast
+
         val_m = {}
         for i, name in enumerate(feature_names):
-            m = evaluate_features(train_all[i], train_labels, val_all[i], val_labels, classifiers_for_ckpt[i])
+            m = eval_fn(train_all[i], train_labels, val_all[i], val_labels, classifiers_for_ckpt[i])
             val_m.update({f"{name}_{k}": v for k, v in m.items()})
 
         epoch_time = time.perf_counter() - t0

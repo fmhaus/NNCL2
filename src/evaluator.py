@@ -192,7 +192,7 @@ def evaluate_features(
     temperature: float = 0.07,
     chunk_size: int = 512,
 ) -> dict[str, float]:
-    """Run kNN, classifier, sparsity, norm, and MIG evaluation and return a combined dict."""
+    """KNN + classifier + sparsity + norms + MIG + ortho."""
     knn   = knn_eval(train_feats, train_labels, val_feats, val_labels, k=k, temperature=temperature, chunk_size=chunk_size)
     clf   = classifier_eval(val_feats, val_labels, classifier, chunk_size=chunk_size)
     spa   = sparsity_eval(val_feats)
@@ -200,4 +200,20 @@ def evaluate_features(
     mig   = mig_eval(val_feats, val_labels)
     ortho = orthogonality_eval(val_feats)
     return {**knn, **clf, **spa, **nrm, **mig, **ortho}
+
+
+def evaluate_features_fast(
+    train_feats:  list[torch.Tensor],
+    train_labels: list[torch.Tensor],
+    val_feats:    list[torch.Tensor],
+    val_labels:   list[torch.Tensor],
+    classifier:   nn.Module,
+    k: int = 20,
+    temperature: float = 0.07,
+    chunk_size: int = 512,
+) -> dict[str, float]:
+    """KNN + classifier only — no MIG, ortho, sparsity, or norms."""
+    knn = knn_eval(train_feats, train_labels, val_feats, val_labels, k=k, temperature=temperature, chunk_size=chunk_size)
+    clf = classifier_eval(val_feats, val_labels, classifier, chunk_size=chunk_size)
+    return {**knn, **clf}
 
