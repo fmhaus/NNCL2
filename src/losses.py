@@ -24,9 +24,10 @@ class NTXentLoss(nn.Module):
         Scalar loss averaged over all 2B views.
     """
 
-    def __init__(self, temperature: float = 0.5):
+    def __init__(self, temperature: float = 0.5, sim_clip_min: float = -1.0):
         super().__init__()
         self.temperature = temperature
+        self.sim_clip_min = sim_clip_min
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         B = z1.size(0)
@@ -40,7 +41,7 @@ class NTXentLoss(nn.Module):
         sim = (z @ z.T) / self.temperature
 
         # Clipped similarities: There is no advantage of more than 90 degrees distance
-        sim = sim.clip(min=0)
+        sim = sim.clip(min=self.sim_clip_min * self.temperature)
 
         # Numerator: sim(z_i, z_j) where j is the positive of i
         # z1[i] pairs with z2[i] and vice versa — stack both directions

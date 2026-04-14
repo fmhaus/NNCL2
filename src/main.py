@@ -228,6 +228,13 @@ def parse_args():
                    help="Learning rate for the online linear classifier optimizer.")
     p.add_argument("--temperature",     default=0.1,        type=float,
                    help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
+    def _cosine_sim(v):
+        v = float(v)
+        if not (-1.0 <= v <= 1.0):
+            raise argparse.ArgumentTypeError(f"--sim-clip-min must be in [-1, 1], got {v}")
+        return v
+    p.add_argument("--sim-clip-min",    default=-1.0,       type=_cosine_sim,
+                   help="Cosine similarity clip threshold for NT-Xent negatives. -1 = no clipping, 0 = clip at 90°.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
@@ -317,7 +324,7 @@ def main():
     classifiers = nn.ModuleList(
         LinearClassifier(dim, num_classes) for dim in eval_dims
     ).to(device)
-    criterion  = NTXentLoss(temperature=args.temperature)
+    criterion  = NTXentLoss(temperature=args.temperature, sim_clip_min=args.sim_clip_min)
 
     # Exclude normalization from weight decay
     _norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)
