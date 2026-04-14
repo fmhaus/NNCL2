@@ -49,26 +49,28 @@ _LAYER_METRICS = [
 ]
 
 
-def _feature_names_from_hparams(hp: dict) -> list[str]:
-    """Reconstruct layer names from hparams (mirrors model.feature_names)."""
-    n = hp.get("proj_layers", 0)
-    if hp.get("no_projector", False):
-        return ["backbone"]
-    return ["backbone"] + [f"proj_{i}" for i in range(n)] + ["head"]
+def _layer_sort_key(n: str) -> tuple:
+    l1 = n.endswith("_l1")
+    base = n[:-3] if l1 else n
+    if base == "backbone": return (0, 0, int(l1))
+    if base == "head":     return (2, 0, int(l1))
+    if base.startswith("proj_"):
+        try: return (1, int(base.split("_")[1]), int(l1))
+        except: pass
+    return (3, 0, int(l1))
 
 
 def _all_layers(runs: list[tuple[str, dict, pd.DataFrame]]) -> list[str]:
-    """Union of layer names across all runs, preserving depth order."""
+    """Discover layer names from CSV columns across all runs."""
+    suffixes = {suffix for suffix, _ in _LAYER_METRICS}
     seen: dict[str, None] = {}
-    for _, hp, _ in runs:
-        for name in _feature_names_from_hparams(hp):
-            seen[name] = None
-    # Sort: backbone first, then proj_0..N, then head
-    def sort_key(n):
-        if n == "backbone": return (0, 0)
-        if n == "head":     return (2, 0)
-        return (1, int(n.split("_")[1]))
-    return sorted(seen, key=sort_key)
+    for _, _, df in runs:
+        for col in df.columns:
+            for suffix in suffixes:
+                if col.endswith(f"_{suffix}"):
+                    seen[col[: -(len(suffix) + 1)]] = None
+                    break
+    return sorted(seen, key=_layer_sort_key)
 
 
 def _plot_ax(ax, runs, col: str, title: str):
@@ -86,7 +88,7 @@ def _plot_ax(ax, runs, col: str, title: str):
     ax.ticklabel_format(useOffset=False, axis="y")
 
 
-def make_figures(runs: list[tuple[str, dict, pd.DataFrame]], save_dir: Path | None):
+def make_figures(runs: list[tuple[str, dict, pd.DataFrame]], save_dir: Path, show: bool = False):
     figs = []
 
     # ── Figure 1: Run-level training metrics ─────────────────────────────
@@ -114,16 +116,15 @@ def make_figures(runs: list[tuple[str, dict, pd.DataFrame]], save_dir: Path | No
         fig.tight_layout()
         figs.append((layer, fig))
 
-    # ── Save or show ──────────────────────────────────────────────────────
-    if save_dir:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        for name, fig in figs:
-            path = save_dir / f"{name}.png"
-            fig.savefig(path, dpi=150, bbox_inches="tight")
-            print(f"Saved {path}")
-        plt.close("all")
-    else:
+    # ── Save and optionally show ──────────────────────────────────────────
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for name, fig in figs:
+        path = save_dir / f"{name}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved {path}")
+    if show:
         plt.show()
+    plt.close("all")
 
 
 def print_summary(runs: list[tuple[str, dict, pd.DataFrame]]):
@@ -145,7 +146,7 @@ def print_summary(runs: list[tuple[str, dict, pd.DataFrame]]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("runs", nargs="+")
-    parser.add_argument("--show", action="store_true", help="Show interactive plots instead of saving")
+    parser.add_argument("--show", action="store_true", help="Show interactive plots in addition to saving")
     args = parser.parse_args()
 
     runs = []
@@ -162,8 +163,8 @@ def main():
         return
 
     print_summary(runs)
-    save_dir = None if args.show else SAVES_DIR / args.runs[0] / "plots"
-    make_figures(runs, save_dir)
+    save_dir = SAVES_DIR / args.runs[0] / "plots"
+    make_figures(runs, save_dir, show=args.show)
 
 
 if __name__ == "__main__":
