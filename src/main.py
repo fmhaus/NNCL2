@@ -60,10 +60,6 @@ def _wrap_tqdm(iterable, use_tqdm: bool, **kwargs):
     return iterable
 
 
-def _l1norm(x: torch.Tensor) -> torch.Tensor:
-    return x / x.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-
 def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> list[float]:
     """Returns top-k accuracy for each k, as fractions in [0, 1]."""
     with torch.no_grad():
@@ -77,16 +73,16 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifiers, eval_names, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     for clf in classifiers:
         clf.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    n_levels  = len(feature_names)  # n_base original + n_base l1 variants
+    n_eval    = len(eval_names)
     sum_nce   = sum_cls = 0.0
-    sum_acc1  = [0.0] * n_levels
-    sum_grad  = [0.0] * n_base      # grads only for original features
+    sum_acc1  = [0.0] * n_eval
+    sum_grad  = [0.0] * n_eval
     n_samples = 0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
@@ -94,18 +90,18 @@ def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, op
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        _grads: list[list[float]] = [[] for _ in range(n_base)]
+        _grads: list[list[float]] = [[] for _ in range(n_eval)]
 
         with autocast:
-            feats1   = model.encode_all(view1)
-            feats2   = model.encode_all(view2)
-            nce_loss = criterion(feats1[-1], feats2[-1])
-            all_feats1 = feats1 + [_l1norm(f.detach()) for f in feats1]
-            all_feats2 = feats2 + [_l1norm(f.detach()) for f in feats2]
+            feats1     = model.encode_all(view1)
+            feats2     = model.encode_all(view2)
+            nce_loss   = criterion(feats1[-1], feats2[-1])
+            eval_f1    = [feats1[0], feats1[-1]]
+            eval_f2    = [feats2[0], feats2[-1]]
             # Classifier on both views averaged — 2× gradient signal per step
-            logits1  = [clf(f.detach()) for clf, f in zip(classifiers, all_feats1)]
-            logits2  = [clf(f.detach()) for clf, f in zip(classifiers, all_feats2)]
-            cls_loss = torch.stack([
+            logits1    = [clf(f.detach()) for clf, f in zip(classifiers, eval_f1)]
+            logits2    = [clf(f.detach()) for clf, f in zip(classifiers, eval_f2)]
+            cls_loss   = torch.stack([
                 (F.cross_entropy(l1, labels) + F.cross_entropy(l2, labels)) / 2
                 for l1, l2 in zip(logits1, logits2)
             ]).mean()
@@ -113,7 +109,7 @@ def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, op
 
         hooks = [
             f.register_hook(lambda g, i=i: _grads[i].append(g.norm().item()))
-            for i, f in enumerate(feats1)
+            for i, f in enumerate(eval_f1)
         ]
 
         optimizer.zero_grad()
@@ -135,7 +131,7 @@ def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, op
         sum_cls += cls_loss.item()
         for i, logit in enumerate(logits1):
             sum_acc1[i] += _topk_accuracy(logit.detach(), labels, topk=(1,))[0] * b
-        for i in range(n_base):
+        for i in range(n_eval):
             sum_grad[i] += _grads[i][0] if _grads[i] else 0.0
         n_samples += b
 
@@ -144,9 +140,8 @@ def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, op
         "train_nce_loss": sum_nce / n,
         "train_cls_loss": sum_cls / n,
     }
-    for i, name in enumerate(feature_names[:n_base]):
+    for i, name in enumerate(eval_names):
         result[f"{name}_grad"]       = sum_grad[i] / n
-    for i, name in enumerate(feature_names):
         result[f"{name}_train_acc1"] = sum_acc1[i] / n_samples
     return result
 
@@ -156,17 +151,19 @@ def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, op
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def extract_all_features(model, feature_names, loader, device, use_tqdm: bool = False, desc: str = "") -> tuple[list[list], list]:
-    """Returns (all_feats, labels) where all_feats[level] is a list of tensors."""
+def extract_eval_features(model, loader, device, use_tqdm: bool = False, desc: str = "") -> tuple[list[list], list]:
+    """Returns ([backbone_feats, head_feats], labels)."""
     model.eval()
     is_cuda = next(model.parameters()).device.type == "cuda"
-    all_feats: list[list] = [[] for _ in feature_names]
+    backbone_feats: list = []
+    head_feats:     list = []
     labels = []
     for images, targets in _wrap_tqdm(loader, use_tqdm, desc=desc, leave=False):
-        for i, f in enumerate(model.encode_all(images.to(device, non_blocking=is_cuda))):
-            all_feats[i].append(f)
+        enc = model.encode_all(images.to(device, non_blocking=is_cuda))
+        backbone_feats.append(enc[0])
+        head_feats.append(enc[-1])
         labels.append(targets.to(device, non_blocking=is_cuda))
-    return all_feats, labels
+    return [backbone_feats, head_feats], labels
 
 
 # ---------------------------------------------------------------------------
@@ -312,13 +309,13 @@ def main():
 
     # --- Model, classifiers, loss, optimiser ---
     proj_layers = None if args.no_projector else args.proj_layers
-    model         = SimCLRModel(proj_out_dim=args.proj_out_dim, proj_layers=proj_layers, image_size=image_size).to(device)
-    base_names    = model.feature_names
-    base_dims     = model.feature_dims
-    feature_names = base_names + [f"{n}_l1" for n in base_names]
-    n_base        = len(base_names)
-    classifiers   = nn.ModuleList(
-        LinearClassifier(dim, num_classes) for dim in base_dims + base_dims
+    model       = SimCLRModel(proj_out_dim=args.proj_out_dim, proj_layers=proj_layers, image_size=image_size).to(device)
+    all_names   = model.feature_names
+    all_dims    = model.feature_dims
+    eval_names  = [all_names[0], all_names[-1]]   # backbone, head
+    eval_dims   = [all_dims[0],  all_dims[-1]]
+    classifiers = nn.ModuleList(
+        LinearClassifier(dim, num_classes) for dim in eval_dims
     ).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
 
@@ -358,19 +355,17 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0      = time.perf_counter()
-        train_m = train_epoch(model, classifiers, feature_names, n_base, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+        train_m = train_epoch(model, classifiers, eval_names, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
 
-        train_base, train_labels = extract_all_features(model, base_names, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
-        val_base,   val_labels   = extract_all_features(model, base_names, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
-        train_all = train_base + [[_l1norm(f) for f in level] for level in train_base]
-        val_all   = val_base   + [[_l1norm(f) for f in level] for level in val_base]
+        train_feats, train_labels = extract_eval_features(model, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
+        val_feats,   val_labels   = extract_eval_features(model, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
 
         full_eval = (epoch + 1) % args.eval_freq == 0 or (epoch + 1) == args.max_epochs
         eval_fn   = evaluate_features if full_eval else evaluate_features_fast
 
         val_m = {}
-        for i, name in enumerate(feature_names):
-            m = eval_fn(train_all[i], train_labels, val_all[i], val_labels, classifiers_for_ckpt[i])
+        for i, name in enumerate(eval_names):
+            m = eval_fn(train_feats[i], train_labels, val_feats[i], val_labels, classifiers_for_ckpt[i])
             val_m.update({f"{name}_{k}": v for k, v in m.items()})
 
         epoch_time = time.perf_counter() - t0

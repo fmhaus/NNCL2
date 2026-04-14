@@ -30,21 +30,26 @@ class NTXentLoss(nn.Module):
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         B = z1.size(0)
-        device = z1.device
 
         # L2-normalize so dot product == cosine similarity
         z1 = F.normalize(z1, dim=1)
         z2 = F.normalize(z2, dim=1)
 
-        # Concatenate into (2B, D) and compute full similarity matrix (2B, 2B)
-        z = torch.cat([z1, z2], dim=0)
-        sim = torch.mm(z, z.T) / self.temperature
+        # Full (2B, 2B) similarity matrix / τ
+        z   = torch.cat([z1, z2], dim=0)
+        sim = (z @ z.T) / self.temperature
 
-        # Mask out self-similarity on the diagonal (not a valid negative)
-        mask = torch.eye(2 * B, dtype=torch.bool, device=device)
-        sim = sim.masked_fill(mask, float("-inf"))
+        # Clipped similarities: There is no advantage of more than 90 degrees distance
+        sim = sim.clip(min=0)
 
-        # Positive pair for row i is at i+B, and for row i+B is at i
-        labels = torch.cat([torch.arange(B, 2 * B), torch.arange(B)]).to(device)
+        # Numerator: sim(z_i, z_j) where j is the positive of i
+        # z1[i] pairs with z2[i] and vice versa — stack both directions
+        pos = torch.cat([(z1 * z2).sum(dim=1), (z2 * z1).sum(dim=1)]) / self.temperature  # (2B,)
 
-        return F.cross_entropy(sim, labels)
+        # Denominator: logsumexp over all k ≠ i  (mask out self-similarity)
+        self_mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+        log_denom = sim.masked_fill(self_mask, float("-inf")).logsumexp(dim=1)              # (2B,)
+
+        # ℓ(i, j) = −log( exp(pos_i) / Σ_{k≠i} exp(sim_ik) )
+        #          = −(pos_i − log_denom_i)
+        return (log_denom - pos).mean()
