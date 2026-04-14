@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18
 
-
 BACKBONE_DIM = 512  # ResNet18 output dimension
 
 
@@ -30,7 +29,7 @@ class _L2Norm(nn.Module):
 # Projection head
 # ---------------------------------------------------------------------------
 
-class SimplexProjector(nn.Module):
+class Projector(nn.Module):
     """Variable-depth projection head with constant hidden width.
 
     Shape: in_dim → in_dim → ... → in_dim → out_dim
@@ -49,10 +48,10 @@ class SimplexProjector(nn.Module):
         super().__init__()
 
         self.projector = nn.ModuleList(
-            nn.Sequential(nn.Linear(in_dim, in_dim), _ReluGeluGrad(), _L1Norm())
+            nn.Sequential(nn.Linear(in_dim, in_dim), _ReluGeluGrad())
             for _ in range(num_layers)
         )
-        self.head = nn.Sequential(nn.Linear(in_dim, out_dim), _ReluGeluGrad(), _L2Norm())
+        self.head = nn.Sequential(nn.Linear(in_dim, out_dim), _ReluGeluGrad())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.projector:
@@ -108,7 +107,7 @@ class SimCLRModel(nn.Module):
         if proj_layers is None:
             self.projector = nn.Identity()
         else:
-            self.projector = SimplexProjector(BACKBONE_DIM, proj_out_dim, proj_layers)
+            self.projector = Projector(BACKBONE_DIM, proj_out_dim, proj_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns projected embeddings — used for the SSL contrastive loss."""
@@ -121,20 +120,20 @@ class SimCLRModel(nn.Module):
     def encode_all(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Returns features at every level: [backbone, proj_0, ..., head]."""
         feat = self.encode(x)
-        if isinstance(self.projector, SimplexProjector):
+        if isinstance(self.projector, Projector):
             return [feat] + self.projector.forward_intermediates(feat)
         return [feat]
 
     @property
     def feature_names(self) -> list[str]:
-        if not isinstance(self.projector, SimplexProjector):
+        if not isinstance(self.projector, Projector):
             return ["backbone"]
         n_hidden = len(self.projector.projector)
         return ["backbone"] + [f"proj_{i}" for i in range(n_hidden)] + ["head"]
 
     @property
     def feature_dims(self) -> list[int]:
-        if not isinstance(self.projector, SimplexProjector):
+        if not isinstance(self.projector, Projector):
             return [BACKBONE_DIM]
         n_hidden = len(self.projector.projector)
         out_dim = cast(nn.Linear, self.projector.head[0]).out_features

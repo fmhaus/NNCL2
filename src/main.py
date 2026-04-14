@@ -60,6 +60,10 @@ def _wrap_tqdm(iterable, use_tqdm: bool, **kwargs):
     return iterable
 
 
+def _l1norm(x: torch.Tensor) -> torch.Tensor:
+    return x / x.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+
 def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> list[float]:
     """Returns top-k accuracy for each k, as fractions in [0, 1]."""
     with torch.no_grad():
@@ -73,16 +77,16 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifiers, feature_names, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(model, classifiers, feature_names, n_base, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
     model.train()
     for clf in classifiers:
         clf.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    n_levels  = len(feature_names)
+    n_levels  = len(feature_names)  # n_base original + n_base l1 variants
     sum_nce   = sum_cls = 0.0
     sum_acc1  = [0.0] * n_levels
-    sum_grad  = [0.0] * n_levels
+    sum_grad  = [0.0] * n_base      # grads only for original features
     n_samples = 0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
@@ -90,15 +94,17 @@ def train_epoch(model, classifiers, feature_names, loader, criterion, optimizer,
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        _grads: list[list[float]] = [[] for _ in feature_names]
+        _grads: list[list[float]] = [[] for _ in range(n_base)]
 
         with autocast:
             feats1   = model.encode_all(view1)
             feats2   = model.encode_all(view2)
             nce_loss = criterion(feats1[-1], feats2[-1])
+            all_feats1 = feats1 + [_l1norm(f.detach()) for f in feats1]
+            all_feats2 = feats2 + [_l1norm(f.detach()) for f in feats2]
             # Classifier on both views averaged — 2× gradient signal per step
-            logits1  = [clf(f.detach()) for clf, f in zip(classifiers, feats1)]
-            logits2  = [clf(f.detach()) for clf, f in zip(classifiers, feats2)]
+            logits1  = [clf(f.detach()) for clf, f in zip(classifiers, all_feats1)]
+            logits2  = [clf(f.detach()) for clf, f in zip(classifiers, all_feats2)]
             cls_loss = torch.stack([
                 (F.cross_entropy(l1, labels) + F.cross_entropy(l2, labels)) / 2
                 for l1, l2 in zip(logits1, logits2)
@@ -127,9 +133,10 @@ def train_epoch(model, classifiers, feature_names, loader, criterion, optimizer,
         b = labels.size(0)
         sum_nce += nce_loss.item()
         sum_cls += cls_loss.item()
-        for i, l1 in enumerate(logits1):
-            sum_acc1[i] += _topk_accuracy(l1.detach(), labels, topk=(1,))[0] * b
-            sum_grad[i]  += _grads[i][0] if _grads[i] else 0.0
+        for i, logit in enumerate(logits1):
+            sum_acc1[i] += _topk_accuracy(logit.detach(), labels, topk=(1,))[0] * b
+        for i in range(n_base):
+            sum_grad[i] += _grads[i][0] if _grads[i] else 0.0
         n_samples += b
 
     n = len(loader)
@@ -137,9 +144,10 @@ def train_epoch(model, classifiers, feature_names, loader, criterion, optimizer,
         "train_nce_loss": sum_nce / n,
         "train_cls_loss": sum_cls / n,
     }
+    for i, name in enumerate(feature_names[:n_base]):
+        result[f"{name}_grad"]       = sum_grad[i] / n
     for i, name in enumerate(feature_names):
-        result[f"{name}_grad"]        = sum_grad[i]  / n
-        result[f"{name}_train_acc1"]  = sum_acc1[i]  / n_samples
+        result[f"{name}_train_acc1"] = sum_acc1[i] / n_samples
     return result
 
 
@@ -203,8 +211,6 @@ def parse_args():
     )
     p.add_argument("--name",            required=True,
                    help="Run name. Results saved to saves/<name>/.")
-    p.add_argument("--method",          default="simclr",  choices=["simclr", "byol"],
-                   help="SSL method. byol is not yet implemented.")
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
@@ -214,8 +220,6 @@ def parse_args():
                    help="Hidden x→x blocks before the final compression. 0 = head only.")
     p.add_argument("--no-projector",  action="store_true",
                    help="Disable the projection head entirely.")
-    p.add_argument("--pred-hidden-dim", default=512,        type=int,
-                   help="BYOL predictor hidden dim (reserved).")
     p.add_argument("--max-epochs",      default=200,        type=int)
     p.add_argument("--warmup-epochs",   default=10,         type=int)
     p.add_argument("--batch-size",      default=256,        type=int)
@@ -240,10 +244,7 @@ def parse_args():
     p.add_argument("--tqdm",            action="store_true",
                    help="Show tqdm progress bars inside each epoch.")
 
-    args = p.parse_args()
-    if args.method == "byol":
-        p.error("--method byol is not yet implemented.")
-    return args
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +292,7 @@ def main():
 
     logger = TrainingLogger(save_dir, args, console_log=args.console_log)
 
-    print(f"Method: {args.method} | Dataset: {args.dataset} | Device: {device} | Precision: {args.precision}")
+    print(f"Dataset: {args.dataset} | Device: {device} | Precision: {args.precision}")
 
     # --- Data ---
     if args.dataset == "cifar100":
@@ -305,16 +306,19 @@ def main():
             batch_size=args.batch_size, num_workers=args.num_workers, data_root=args.data_root,
         )
 
-    train_loader = get_data_loader(two_view=True,  augment=args.method, train=True)
+    train_loader = get_data_loader(two_view=True,  augment="simclr", train=True)
     knn_train    = get_data_loader(two_view=False, augment=None,        train=True)
     knn_val      = get_data_loader(two_view=False, augment=None,        train=False)
 
     # --- Model, classifiers, loss, optimiser ---
     proj_layers = None if args.no_projector else args.proj_layers
-    model       = SimCLRModel(proj_out_dim=args.proj_out_dim, proj_layers=proj_layers, image_size=image_size).to(device)
-    feature_names = model.feature_names
+    model         = SimCLRModel(proj_out_dim=args.proj_out_dim, proj_layers=proj_layers, image_size=image_size).to(device)
+    base_names    = model.feature_names
+    base_dims     = model.feature_dims
+    feature_names = base_names + [f"{n}_l1" for n in base_names]
+    n_base        = len(base_names)
     classifiers   = nn.ModuleList(
-        LinearClassifier(dim, num_classes) for dim in model.feature_dims
+        LinearClassifier(dim, num_classes) for dim in base_dims + base_dims
     ).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
 
@@ -354,10 +358,12 @@ def main():
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
         t0      = time.perf_counter()
-        train_m = train_epoch(model, classifiers, feature_names, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+        train_m = train_epoch(model, classifiers, feature_names, n_base, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
 
-        train_all, train_labels = extract_all_features(model, feature_names, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
-        val_all,   val_labels   = extract_all_features(model, feature_names, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
+        train_base, train_labels = extract_all_features(model, base_names, knn_train, device, args.tqdm, desc=f"knn-train [epoch {epoch + 1}]")
+        val_base,   val_labels   = extract_all_features(model, base_names, knn_val,   device, args.tqdm, desc=f"knn-val   [epoch {epoch + 1}]")
+        train_all = train_base + [[_l1norm(f) for f in level] for level in train_base]
+        val_all   = val_base   + [[_l1norm(f) for f in level] for level in val_base]
 
         full_eval = (epoch + 1) % args.eval_freq == 0 or (epoch + 1) == args.max_epochs
         eval_fn   = evaluate_features if full_eval else evaluate_features_fast
