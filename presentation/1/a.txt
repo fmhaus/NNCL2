@@ -1,0 +1,15 @@
+sparsity: nonzero
+after backbone, before avg pool
+in projection head
+
+simplify projector - backbone
+
+test different projector
+
+simple and generic
+
+DINO paper about layer normalization: Emerging Properties in Self-Supervised Vision Transformers
+
+quantify sparsity
+
+activation size distribution

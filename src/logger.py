@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -89,6 +90,14 @@ class TrainingLogger:
         if self.use_openbayestool:
             for key, value in metrics.items():
                 log_metric(key, value)
+
+    def log_activation_histogram(self, epoch: int, name: str, tensor: torch.Tensor, bins: int = 100) -> None:
+        """Save a histogram of tensor values to histograms/<name>_<epoch>.npz."""
+        values = tensor.detach().float().cpu().numpy().ravel()
+        counts, edges = np.histogram(values, bins=bins)
+        hist_dir = self.save_dir / "histograms"
+        hist_dir.mkdir(exist_ok=True)
+        np.savez_compressed(hist_dir / f"{name}_{epoch:04d}.npz", counts=counts, edges=edges)
 
     def save_checkpoint(self, epoch: int, state: dict) -> None:
         """Save state dict, then delete the previous checkpoint."""

@@ -1,0 +1,20 @@
+original pipeline
+INVESTIGATE: sparsity at different layers
+semantic features
+
+superpositition of 2 images
+
+look carefully at hoyer sparsity (derivation)
+
+
+better understand geometry
+histograms
+what does distribution look like
+
+double check all values
+explain 
+
+
+(maybe, try plot similarity histogram)
+
+Without L2 normalization, the contrastive task accuracy is higher, but the resulting representation is worse under linear evaluation.
