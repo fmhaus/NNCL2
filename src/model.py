@@ -1,4 +1,3 @@
-from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,33 +29,20 @@ class SimCLRModel(nn.Module):
         proj_hidden: int = 512,
         proj_dim: int = 128,
         image_size: int = 224,
-        feature_transform: None | Literal["relu", "simplex_proj", "softmax", "L1_norm", "relu_norm"] = None,
         use_projector: bool = True
     ):
         super().__init__()
 
-        base = resnet18(weights=None)
+        self.backbone = resnet18(weights=None)
 
         if image_size <= 64:
             # Replace 7×7 stride-2 conv + maxpool with 3×3 stride-1 conv.
             # Preserves spatial resolution for small images (CIFAR-100: 32, TinyImageNet: 64).
-            base.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            base.maxpool = nn.Identity() # type: ignore
+            self.backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.backbone.maxpool = nn.Identity() # type: ignore
 
-        self.backbone = nn.Sequential(*list(base.children())[:-1])  # (B, 512, 1, 1)
-
-        if feature_transform is None:
-            self.feature_transform = nn.Identity()
-        elif feature_transform == "relu":
-            self.feature_transform = ReluGeluGrad()
-        elif feature_transform == "softmax":
-            self.feature_transform = nn.Softmax(dim=-1)
-        elif feature_transform == "L1_norm":
-            self.feature_transform = ShiftL1Norm()
-        elif feature_transform == "relu_norm":
-            self.feature_transform = ReluNorm()
-            
-
+        # remove fast forward projector
+        self.backbone.fc = nn.Identity() # type: ignore 
 
         if use_projector:
             self.projector = nn.Sequential(
@@ -73,49 +59,14 @@ class SimCLRModel(nn.Module):
         """Returns projected embeddings — used for the SSL contrastive loss."""
         return self.projector(self.encode(x))
 
-    def backbone_raw(self, x: torch.Tensor) -> torch.Tensor:
-        """Backbone output before feature_transform. Shape: (B, 512)."""
-        return self.backbone(x).flatten(1)
-
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Returns backbone embeddings after feature_transform. Shape: (B, 512)."""
-        return self.feature_transform(self.backbone_raw(x))
-
-
-class ShiftL1Norm(nn.Module):
-    """Shift to non-negative then L1-normalize: (x - min) / sum(x - min)."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x - x.min(dim=1, keepdim=True).values
-        return x / x.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-
-class ReluGeluGrad(nn.Module):
-    """Forward pass of ReLU, backward pass (gradient) of GELU.
-    """
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(x).detach() + F.gelu(x) - F.gelu(x).detach()
-
-class ReluNorm(ReluGeluGrad):
-    """Relu (with gelu grad) and normalized (L1) to simplex plane"""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().forward(x)
-        return x / x.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return self.backbone(x).flatten(1)
 
 
 class LinearClassifier(nn.Module):
-    """Linear head for linear probing or fine-tuning on top of a frozen SimCLR backbone.
-
-    Usage:
-        model = SimCLRModel()
-        # ... load pretrained weights ...
-        classifier = LinearClassifier(num_classes=100)
-
-        model.backbone.eval()
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-
-        features = model.encode(images)   # (B, 512), no grad through backbone
-        logits   = classifier(features)   # (B, num_classes)
+    """
+    Linear head for linear probing or fine-tuning on top of a frozen SimCLR backbone.
     """
 
     def __init__(self, num_classes: int):

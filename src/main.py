@@ -79,20 +79,18 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
 
     sum_nce = sum_cls = 0.0
     sum_acc1 = sum_acc5 = n_samples = 0
-    sum_grad_backbone = sum_grad_feat = sum_grad_proj_out = 0.0
+    sum_grad_feat = sum_grad_proj_out = 0.0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
         view1  = view1.to(device, non_blocking=is_cuda)
         view2  = view2.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        _grad_backbone = []
         _grad_feat     = []
         _grad_proj_out = []
 
         with autocast:
-            raw1     = model.backbone_raw(view1)
-            feat1    = model.feature_transform(raw1)
+            feat1    = model.encode(view1)
             feat2    = model.encode(view2)
             proj_out = model.projector(feat1)
             nce_loss = criterion(proj_out, model.projector(feat2))
@@ -102,8 +100,6 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
             cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
             loss     = nce_loss + cls_loss
 
-        # Three gradient positions: loss→projector, projector→feature_transform, feature_transform→backbone
-        raw1_hook     = raw1.register_hook(lambda g: _grad_backbone.append(g.norm().item()))
         feat_hook     = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
         proj_out_hook = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
 
@@ -115,14 +111,12 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         else:
             loss.backward()
             optimizer.step()
-            
+
         scheduler.step()
 
-        raw1_hook.remove()
         feat_hook.remove()
         proj_out_hook.remove()
 
-        sum_grad_backbone += _grad_backbone[0] if _grad_backbone else 0.0
         sum_grad_feat     += _grad_feat[0]     if _grad_feat     else 0.0
         sum_grad_proj_out += _grad_proj_out[0] if _grad_proj_out else 0.0
 
@@ -138,7 +132,6 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
     return {
         "train_nce_loss":      sum_nce          / n,
         "train_class_loss":    sum_cls          / n,
-        "grad_backbone_norm":  sum_grad_backbone / n,
         "grad_feat_norm":  sum_grad_feat     / n,
         "grad_proj_out_norm":  sum_grad_proj_out / n,
         "train_acc1_epoch": sum_acc1 / n_samples,
@@ -279,9 +272,6 @@ def parse_args():
     p.add_argument("--proj-output-dim",    default=128,        type=int)
     p.add_argument("--no-projector",       action="store_true",
                    help="Disable the projection head (apply loss directly on backbone features).")
-    p.add_argument("--feature-transform",  default=None,
-                   choices=["relu", "softmax", "L1_norm", "relu_norm"],
-                   help="Non-negative transform applied to backbone features before projector and downstream tasks.")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")
     p.add_argument("--max-epochs",      default=200,        type=int)
@@ -376,18 +366,24 @@ def main():
     knn_val      = get_data_loader(two_view=False, augment=None,        train=False)
 
     # --- Model, classifier, loss, optimiser ---
-    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector, feature_transform=args.feature_transform).to(device)
+    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, use_projector=not args.no_projector).to(device)
     classifier = LinearClassifier(num_classes=num_classes).to(device)
     criterion  = NTXentLoss(temperature=args.temperature)
 
-    # Exclude normalization from weight decay
+    # Exclude normalization layers and biases from weight decay
     _norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)
     decay, no_decay = [], []
     for module in model.modules():
         if isinstance(module, _norm_types):
             no_decay.extend(module.parameters(recurse=False))
         else:
-            decay.extend(p for p in module.parameters(recurse=False) if p.requires_grad)
+            for name, p in module.named_parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                if name == "bias":
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
 
     optimizer = SGD(
         [
@@ -429,7 +425,6 @@ def main():
             "train_acc5_epoch": train_m["train_acc5_epoch"],
             "val_knn_acc1":     knn_acc1,
             "val_knn_acc5":     knn_acc5,
-            "grad_backbone_norm":  train_m["grad_backbone_norm"],
             "grad_feat_norm":      train_m["grad_feat_norm"],
             "grad_proj_out_norm":  train_m["grad_proj_out_norm"],
             "val_loss":         val_m["val_loss"],

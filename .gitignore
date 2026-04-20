@@ -39,3 +39,5 @@ Thumbs.db
 
 # HuggingFace cache (if redirected locally)
 .cache/
+
+presentation/
