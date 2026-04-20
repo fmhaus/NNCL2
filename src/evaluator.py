@@ -124,23 +124,31 @@ def sparsity_eval(feats: list[torch.Tensor]) -> dict[str, float]:
 
 
 @torch.no_grad()
-def orthogonality_eval(feats: list[torch.Tensor], min_sum_frac: float = 0.01) -> dict[str, float]:
-    """Measures how orthogonal the feature dimensions are.
+def orthogonality_eval(feats: list[torch.Tensor], labels: list[torch.Tensor], min_sum_frac: float = 0.01) -> dict[str, float]:
+    """Measures how orthogonal the feature dimensions are across class prototypes.
 
-    Column-normalizes features, computes the D×D correlation matrix, and
-    measures deviation from the identity via off-diagonal absolute values.
-    Lower is better — 0 means perfectly orthogonal dimensions.
+    Computes the per-class mean feature vector (prototype), column-normalizes
+    the (C, D) prototype matrix, then measures deviation of the D×D correlation
+    matrix from the identity via off-diagonal absolute values.
+    Lower is better — 0 means perfectly orthogonal dimensions across classes.
 
     Returns:
         {"ortho_mean": float, "ortho_median": float}
     """
-    f      = torch.cat(feats).float()
-    active = f.sum(0) > min_sum_frac * f.size(0)
-    f      = f[:, active]
-    f      = F.normalize(f, dim=0)
-    corr   = f.T @ f
-    err    = (corr - torch.eye(corr.size(0), device=corr.device)).abs()
-    mask   = ~torch.eye(corr.size(0), dtype=torch.bool, device=corr.device)
+    f = torch.cat(feats).float()
+    y = torch.cat(labels)
+
+    classes   = y.unique()
+    prototypes = torch.stack([f[y == c].mean(0) for c in classes])  # (C, D)
+
+    active = prototypes.sum(0).abs() > min_sum_frac * prototypes.size(0)
+    prototypes = prototypes[:, active]
+
+    prototypes = F.normalize(prototypes, dim=0)  # column-normalize across classes
+    corr       = prototypes.T @ prototypes        # (D, D)
+
+    err      = (corr - torch.eye(corr.size(0), device=corr.device)).abs()
+    mask     = ~torch.eye(corr.size(0), dtype=torch.bool, device=corr.device)
     off_diag = err[mask]
     return {
         "ortho_mean":   off_diag.mean().item(),
@@ -198,7 +206,7 @@ def evaluate_features(
     spa   = sparsity_eval(val_feats)
     nrm   = feature_norms_eval(torch.cat(val_feats).float())
     mig   = mig_eval(val_feats, val_labels)
-    ortho = orthogonality_eval(val_feats)
+    ortho = orthogonality_eval(val_feats, val_labels)
     return {**knn, **clf, **spa, **nrm, **mig, **ortho}
 
 
