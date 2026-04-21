@@ -32,6 +32,7 @@ _METRIC_KEYS = [
     "val_acc5",
     "feat_l1",
     "feat_l2",
+    "feat_hoyer",
     "lr",
     "epoch_time_s",
 ]

@@ -29,7 +29,7 @@ class SimCLRModel(nn.Module):
         proj_hidden: int = 512,
         proj_dim: int = 128,
         image_size: int = 224,
-        use_projector: bool = True
+        projector: str = "mlp",   # "none" | "mlp" | "mlp-bn"
     ):
         super().__init__()
 
@@ -42,18 +42,27 @@ class SimCLRModel(nn.Module):
             self.backbone.maxpool = nn.Identity() # type: ignore
 
         # remove fast forward projector
-        self.backbone.fc = nn.Identity() # type: ignore 
+        self.backbone.fc = nn.Identity() # type: ignore
 
-        if use_projector:
+        if projector == "none":
+            self.projector: nn.Module = nn.Identity()
+        elif projector == "mlp":
             self.projector = nn.Sequential(
                 nn.Linear(BACKBONE_DIM, proj_hidden),
-                nn.BatchNorm1d(proj_hidden),
                 nn.ReLU(inplace=True),
                 nn.Linear(proj_hidden, proj_dim),
+            )
+        elif projector == "mlp-bn":
+            # SimCLR paper: BN after each linear layer
+            self.projector = nn.Sequential(
+                nn.Linear(BACKBONE_DIM, proj_hidden, bias=False),
+                nn.BatchNorm1d(proj_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_hidden, proj_dim, bias=False),
                 nn.BatchNorm1d(proj_dim),
             )
         else:
-            self.projector = nn.Identity()
+            raise ValueError(f"Unknown projector '{projector}'. Choose: none, mlp, mlp-bn.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns projected embeddings — used for the SSL contrastive loss."""

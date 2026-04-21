@@ -94,7 +94,7 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
             feat2    = model.encode(view2)
             proj_out = model.projector(feat1)
             nce_loss = criterion(proj_out, model.projector(feat2))
-            # Classifier on both views averaged - 2 gradient signal per step
+            # Classifier on both views averaged — 2× gradient signal per step
             logits1  = classifier(feat1.detach())
             logits2  = classifier(feat2.detach())
             cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
@@ -132,10 +132,10 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
     return {
         "train_nce_loss":      sum_nce          / n,
         "train_class_loss":    sum_cls          / n,
-        "grad_feat_norm":  sum_grad_feat     / n,
+        "grad_feat_norm":      sum_grad_feat     / n,
         "grad_proj_out_norm":  sum_grad_proj_out / n,
-        "train_acc1_epoch": sum_acc1 / n_samples,
-        "train_acc5_epoch": sum_acc5 / n_samples,
+        "train_acc1_epoch":    sum_acc1 / n_samples,
+        "train_acc5_epoch":    sum_acc5 / n_samples,
     }
 
 
@@ -227,22 +227,6 @@ def knn_accuracy(
 
 
 # ---------------------------------------------------------------------------
-# Activation histograms — single eval batch
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def record_activation_histograms(model, loader, logger, epoch, device):
-    model.eval()
-    is_cuda = next(model.parameters()).device.type == "cuda"
-    images, _ = next(iter(loader))
-    images = images.to(device, non_blocking=is_cuda)
-    feat = model.encode(images)
-    proj = model.projector(feat)
-    logger.log_activation_histogram(epoch, "encoder_out", feat)
-    logger.log_activation_histogram(epoch, "proj_out", proj)
-
-
-# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -289,9 +273,9 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim",    default=2048,        type=int)
-    p.add_argument("--proj-output-dim",    default=128,        type=int)
-    p.add_argument("--projector",          default="mlp",      choices=["none", "mlp", "mlp-bn"],
+    p.add_argument("--proj-hidden-dim", default=2048,       type=int)
+    p.add_argument("--proj-output-dim", default=128,        type=int)
+    p.add_argument("--projector",       default="mlp",      choices=["none", "mlp", "mlp-bn"],
                    help="Projection head variant: none (identity), mlp (linear-relu-linear), mlp-bn (SimCLR paper, BN after each linear).")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")
@@ -300,9 +284,8 @@ def parse_args():
     p.add_argument("--batch-size",      default=256,        type=int)
     p.add_argument("--lr",              default=None,       type=float,
                    help="Learning rate. Default: 0.3 * batch_size / 256.")
-    p.add_argument("--weight-decay",     default=1e-4,       type=float)
-
-    p.add_argument("--classifier-lr",   default=0.1,        type=float,
+    p.add_argument("--weight-decay",    default=1e-4,       type=float)
+    p.add_argument("--classifier-lr",  default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
     p.add_argument("--temperature",     default=0.1,        type=float,
                    help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
@@ -310,7 +293,7 @@ def parse_args():
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
                    help="Resume training from saves/<name>/. Overrides all args from hparams.json.")
-    p.add_argument("--compile",          action="store_true",
+    p.add_argument("--compile",         action="store_true",
                    help="torch.compile the model and classifier.")
     p.add_argument("--console-log",     action="store_true",
                    help="Print metrics to console after every epoch.")
@@ -433,30 +416,29 @@ def main():
 
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
-        t0           = time.perf_counter()
-        train_m    = train_epoch(model, classifier, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
+        t0             = time.perf_counter()
+        train_m        = train_epoch(model, classifier, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
         knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        val_m              = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        record_activation_histograms(model, knn_val, logger, epoch + 1, device)
-        epoch_time   = time.perf_counter() - t0
+        val_m          = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
+        epoch_time     = time.perf_counter() - t0
 
         metrics = {
-            "train_nce_loss":   train_m["train_nce_loss"],
-            "train_class_loss": train_m["train_class_loss"],
-            "train_acc1_epoch": train_m["train_acc1_epoch"],
-            "train_acc5_epoch": train_m["train_acc5_epoch"],
-            "val_knn_acc1":     knn_acc1,
-            "val_knn_acc5":     knn_acc5,
+            "train_nce_loss":      train_m["train_nce_loss"],
+            "train_class_loss":    train_m["train_class_loss"],
+            "train_acc1_epoch":    train_m["train_acc1_epoch"],
+            "train_acc5_epoch":    train_m["train_acc5_epoch"],
+            "val_knn_acc1":        knn_acc1,
+            "val_knn_acc5":        knn_acc5,
             "grad_feat_norm":      train_m["grad_feat_norm"],
             "grad_proj_out_norm":  train_m["grad_proj_out_norm"],
-            "val_loss":         val_m["val_loss"],
-            "val_acc1":         val_m["val_acc1"],
-            "val_acc5":         val_m["val_acc5"],
-            "feat_l1":          val_m["feat_l1"],
-            "feat_l2":          val_m["feat_l2"],
-            "feat_hoyer":       val_m["feat_hoyer"],
-            "lr":               scheduler.get_last_lr()[0],
-            "epoch_time_s":     epoch_time,
+            "val_loss":            val_m["val_loss"],
+            "val_acc1":            val_m["val_acc1"],
+            "val_acc5":            val_m["val_acc5"],
+            "feat_l1":             val_m["feat_l1"],
+            "feat_l2":             val_m["feat_l2"],
+            "feat_hoyer":          val_m["feat_hoyer"],
+            "lr":                  scheduler.get_last_lr()[0],
+            "epoch_time_s":        epoch_time,
         }
         logger.log(epoch + 1, metrics)
         logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifier_for_ckpt, optimizer, scheduler, scaler, args))
