@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -98,7 +99,8 @@ def disentanglement(R: np.ndarray) -> tuple[np.ndarray, float]:
     C = R.shape[0]
     col_sum = R.sum(axis=0).clip(min=1e-8)                   # (D,)
     p = R / col_sum[None, :]                                  # (C, D)
-    log_p = np.where(p > 0, np.log(p), 0.0)
+    log_p = np.log(p.clip(min=1e-10))
+    log_p[p == 0] = 0.0
     h = -(p * log_p).sum(axis=0) / np.log(C)                 # (D,) normalised entropy
     per_dim = 1.0 - h                                         # (D,)
     weights = col_sum / col_sum.sum()                         # (D,) relative importance of each dim
@@ -118,7 +120,8 @@ def completeness(R: np.ndarray) -> tuple[np.ndarray, float]:
     D = R.shape[1]
     row_sum = R.sum(axis=1).clip(min=1e-8)                   # (C,)
     p = R / row_sum[:, None]                                  # (C, D)
-    log_p = np.where(p > 0, np.log(p), 0.0)
+    log_p = np.log(p.clip(min=1e-10))
+    log_p[p == 0] = 0.0
     h = -(p * log_p).sum(axis=1) / np.log(D)                 # (C,)
     per_class = 1.0 - h                                       # (C,)
     weights = row_sum / row_sum.sum()                         # (C,)
@@ -136,7 +139,7 @@ def compute_per_class_stats(
     num_classes: int,
     save_path: Path,
     device: torch.device,
-) -> None:
+) -> dict:
     """Compute per-class feature statistics and representation quality metrics.
 
     Accumulates online sufficient statistics (sum, sum-of-squares, count) so
@@ -212,6 +215,14 @@ def compute_per_class_stats(
     dis_per_dim, dis_scalar = disentanglement(R_np)
     com_per_class, com_scalar = completeness(R_np)
 
+    scalars = {
+        "mean_separability":   separability.mean().item(),
+        "dead_dim_fraction":   dead_fraction,
+        "disentanglement_score": dis_scalar,
+        "completeness_score":  com_scalar,
+        "zero_fraction":       sum_zero / n_total,
+    }
+
     save_path.parent.mkdir(exist_ok=True)
     np.savez_compressed(
         save_path,
@@ -220,20 +231,17 @@ def compute_per_class_stats(
         within_var=within_var.cpu().numpy(),
         between_var=between_var.cpu().numpy(),
         separability=separability.cpu().numpy(),
-        mean_separability=separability.mean().item(),
         dim_rms=dim_rms.cpu().numpy(),
-        dead_dim_fraction=dead_fraction,
         mean_l1=sum_l1 / n_total,
         mean_l2=sum_l2 / n_total,
         mean_hoyer=sum_hoyer / n_total,
-        zero_fraction=sum_zero / n_total,
         R=R_np,
         disentanglement=dis_per_dim,
-        disentanglement_score=dis_scalar,
         completeness=com_per_class,
-        completeness_score=com_scalar,
+        **scalars,
     )
     print(f"Saved per-class stats → {save_path}")
+    return scalars
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +380,9 @@ def main():
     # --- Layer evaluations ---
     def _run_layer(name: str, layer_fn: Callable[[torch.Tensor], torch.Tensor]) -> dict:
         stats = eval_layer(layer_fn, val_loader, name, logger, epoch, device)
-        compute_per_class_stats(layer_fn, val_loader, num_classes,
-                                per_class_dir / f"{name}_{epoch:04d}.npz", device)
+        pc_scalars = compute_per_class_stats(layer_fn, val_loader, num_classes,
+                                             per_class_dir / f"{name}_{epoch:04d}.npz", device)
+        stats.update({f"{name}_{k}": v for k, v in pc_scalars.items()})
         return stats
 
     encoder_stats = _run_layer("encoder_out", lambda imgs: model.encode(imgs))
@@ -409,12 +418,30 @@ def main():
         **proj_stats,   # empty when projector == "none"
     }
 
+    _acc_keys = {"knn_acc1", "knn_acc5", "probe_acc1", "probe_acc5"}
     col_w = max(len(k) for k in metrics) + 2
     print(f"\n{'Metric':<{col_w}} Value")
     print("-" * (col_w + 10))
     for k, v in metrics.items():
-        val_str = f"{v:.4f}" if isinstance(v, float) else str(v)
+        if isinstance(v, float):
+            val_str = f"{v * 100:.2f}%" if k in _acc_keys else f"{v:.4f}"
+        else:
+            val_str = str(v)
         print(f"{k:<{col_w}} {val_str}")
+
+    # --- Export to CSV ---
+    csv_path = save_dir / "eval_metrics.csv"
+    row = {k: v for k, v in metrics.items()}
+    if csv_path.exists():
+        existing = pd.read_csv(csv_path)
+        # Overwrite row for this epoch if it already exists
+        existing = existing[existing["epoch"] != epoch]
+        df = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+    df = df.sort_values("epoch").reset_index(drop=True)
+    df.to_csv(csv_path, index=False)
+    print(f"\nSaved → {csv_path}")
 
 
 if __name__ == "__main__":
