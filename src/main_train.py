@@ -273,7 +273,7 @@ def parse_args():
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
-    p.add_argument("--proj-hidden-dim", default=2048,       type=int)
+    p.add_argument("--proj-hidden-dim", default=512,        type=int)
     p.add_argument("--proj-output-dim", default=128,        type=int)
     p.add_argument("--projector",       default="mlp",      choices=["none", "mlp", "mlp-bn"],
                    help="Projection head variant: none (identity), mlp (linear-relu-linear), mlp-bn (SimCLR paper, BN after each linear).")
@@ -287,18 +287,19 @@ def parse_args():
     p.add_argument("--weight-decay",    default=1e-4,       type=float)
     p.add_argument("--classifier-lr",  default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
-    p.add_argument("--temperature",     default=0.1,        type=float,
-                   help="NT-Xent temperature. Paper: 0.1 for CIFAR, 0.07 for ImageNet.")
+    p.add_argument("--temperature",     default=0.5,        type=float,
+                   help="NT-Xent temperature. SimCLR paper optimum: 0.5.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
     p.add_argument("--resume",          action="store_true",
                    help="Resume training from saves/<name>/. Overrides all args from hparams.json.")
-    p.add_argument("--compile",         action="store_true",
-                   help="torch.compile the model and classifier.")
-    p.add_argument("--console-log",     action="store_true",
-                   help="Print metrics to console after every epoch.")
-    p.add_argument("--tqdm",            action="store_true",
-                   help="Show tqdm progress bars inside each epoch.")
+    p.add_argument("--no-compile",      action="store_false", dest="compile",
+                   help="Disable torch.compile.")
+    p.add_argument("--no-console-log",  action="store_false", dest="console_log",
+                   help="Suppress per-epoch metric printing.")
+    p.add_argument("--no-tqdm",         action="store_false", dest="tqdm",
+                   help="Disable tqdm progress bars inside each epoch.")
+    p.set_defaults(compile=True, console_log=True, tqdm=True)
 
     args = p.parse_args()
     if args.method == "byol":
