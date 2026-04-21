@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -78,6 +79,161 @@ def eval_layer(
         f"{name}_l2":    sum_l2    / n,
         f"{name}_hoyer": sum_hoyer / n,
     }
+
+
+# ---------------------------------------------------------------------------
+# Disentanglement / completeness from an arbitrary R matrix
+# ---------------------------------------------------------------------------
+
+def disentanglement(R: np.ndarray) -> tuple[np.ndarray, float]:
+    """Disentanglement score per feature dimension and as a weighted scalar.
+
+    Args:
+        R: (C, D) relative-importance matrix, non-negative.
+
+    Returns:
+        per_dim: (D,) score in [0, 1]; 1 = dimension important for exactly one class
+        scalar:  weighted average, weighted by each dimension's total importance
+    """
+    C = R.shape[0]
+    col_sum = R.sum(axis=0).clip(min=1e-8)                   # (D,)
+    p = R / col_sum[None, :]                                  # (C, D)
+    log_p = np.where(p > 0, np.log(p), 0.0)
+    h = -(p * log_p).sum(axis=0) / np.log(C)                 # (D,) normalised entropy
+    per_dim = 1.0 - h                                         # (D,)
+    weights = col_sum / col_sum.sum()                         # (D,) relative importance of each dim
+    return per_dim, float((weights * per_dim).sum())
+
+
+def completeness(R: np.ndarray) -> tuple[np.ndarray, float]:
+    """Completeness score per class and as a weighted scalar.
+
+    Args:
+        R: (C, D) relative-importance matrix, non-negative.
+
+    Returns:
+        per_class: (C,) score in [0, 1]; 1 = class explained by exactly one dimension
+        scalar:    weighted average, weighted by each class's total importance
+    """
+    D = R.shape[1]
+    row_sum = R.sum(axis=1).clip(min=1e-8)                   # (C,)
+    p = R / row_sum[:, None]                                  # (C, D)
+    log_p = np.where(p > 0, np.log(p), 0.0)
+    h = -(p * log_p).sum(axis=1) / np.log(D)                 # (C,)
+    per_class = 1.0 - h                                       # (C,)
+    weights = row_sum / row_sum.sum()                         # (C,)
+    return per_class, float((weights * per_class).sum())
+
+
+# ---------------------------------------------------------------------------
+# Per-class feature statistics
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_per_class_stats(
+    layer_fn: Callable[[torch.Tensor], torch.Tensor],
+    loader,
+    num_classes: int,
+    save_path: Path,
+    device: torch.device,
+) -> None:
+    """Compute per-class feature statistics and representation quality metrics.
+
+    Accumulates online sufficient statistics (sum, sum-of-squares, count) so
+    the full feature matrix never needs to be held in memory.
+
+    Saved arrays in ``save_path``:
+        mean              (C, D)  per-class mean
+        var               (C, D)  per-class variance
+        within_var        (D,)    weighted mean of per-class variances
+        between_var       (D,)    variance of class means weighted by class counts
+        separability      (D,)    between_var / total_var ∈ [0, 1]
+        mean_separability scalar  mean separability across all dimensions
+        R                 (C, D)  relative importance: each class's contribution to separability
+        disentanglement   (D,)    per-dimension disentanglement score ∈ [0, 1]
+        completeness      (C,)    per-class completeness score ∈ [0, 1]
+    """
+    is_cuda = device.type == "cuda"
+
+    feat_sum:    torch.Tensor | None = None
+    feat_sum_sq: torch.Tensor | None = None
+    counts:      torch.Tensor | None = None
+    sum_l1 = sum_l2 = sum_hoyer = sum_zero = n_total = 0.0
+    d = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=is_cuda)
+        labels = labels.to(device, non_blocking=is_cuda)
+        acts   = layer_fn(images)   # (B, D)
+
+        if feat_sum is None:
+            d = acts.size(1)
+            feat_sum    = torch.zeros(num_classes, d, device=device)
+            feat_sum_sq = torch.zeros(num_classes, d, device=device)
+            counts      = torch.zeros(num_classes,    device=device)
+        assert feat_sum is not None and feat_sum_sq is not None and counts is not None
+
+        feat_sum.scatter_add_(0, labels.unsqueeze(1).expand_as(acts), acts)
+        feat_sum_sq.scatter_add_(0, labels.unsqueeze(1).expand_as(acts), acts ** 2)
+        counts.scatter_add_(0, labels, torch.ones(labels.size(0), device=device))
+
+        b   = acts.size(0)
+        l1  = acts.norm(p=1, dim=1)
+        l2  = acts.norm(p=2, dim=1)
+        sum_l1    += l1.mean().item() * b
+        sum_l2    += l2.mean().item() * b
+        sum_hoyer += ((d ** 0.5 - l1 / l2.clamp(min=1e-8)) / (d ** 0.5 - 1)).mean().item() * b
+        sum_zero  += (acts == 0).float().mean().item() * b
+        n_total   += b
+
+    assert feat_sum is not None and feat_sum_sq is not None and counts is not None
+    n  = counts.sum()
+    w  = counts / n                                                  # (C,) class weights
+
+    mean        = feat_sum    / counts.unsqueeze(1)                  # (C, D)
+    var         = (feat_sum_sq / counts.unsqueeze(1) - mean ** 2).clamp(min=0)  # (C, D)
+    global_mean = (w.unsqueeze(1) * mean).sum(0)                     # (D,)
+    within_var  = (w.unsqueeze(1) * var).sum(0)                      # (D,)
+    between_var = (w.unsqueeze(1) * (mean - global_mean) ** 2).sum(0)  # (D,)
+    total_var   = within_var + between_var
+    separability = between_var / total_var.clamp(min=1e-8)           # (D,)
+
+    # R_cd = class c's contribution to the separability of dimension d
+    # Columns sum to separability by construction
+    R_np = (w.unsqueeze(1) * (mean - global_mean) ** 2 / total_var.clamp(min=1e-8)).cpu().numpy()  # (C, D)
+
+    # Dead dimensions: RMS activation < threshold across the full dataset
+    # E[x²] = total_var + global_mean²  (second moment = variance + mean²)
+    dim_rms        = (total_var + global_mean ** 2).clamp(min=0).sqrt()   # (D,)
+    dead_threshold = 1e-3
+    dead_dims      = dim_rms < dead_threshold                             # (D,) bool
+    dead_fraction  = dead_dims.float().mean().item()
+
+    dis_per_dim, dis_scalar = disentanglement(R_np)
+    com_per_class, com_scalar = completeness(R_np)
+
+    save_path.parent.mkdir(exist_ok=True)
+    np.savez_compressed(
+        save_path,
+        mean=mean.cpu().numpy(),
+        var=var.cpu().numpy(),
+        within_var=within_var.cpu().numpy(),
+        between_var=between_var.cpu().numpy(),
+        separability=separability.cpu().numpy(),
+        mean_separability=separability.mean().item(),
+        dim_rms=dim_rms.cpu().numpy(),
+        dead_dim_fraction=dead_fraction,
+        mean_l1=sum_l1 / n_total,
+        mean_l2=sum_l2 / n_total,
+        mean_hoyer=sum_hoyer / n_total,
+        zero_fraction=sum_zero / n_total,
+        R=R_np,
+        disentanglement=dis_per_dim,
+        disentanglement_score=dis_scalar,
+        completeness=com_per_class,
+        completeness_score=com_scalar,
+    )
+    print(f"Saved per-class stats → {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -210,24 +366,30 @@ def main():
     # logger writes histograms to saves/<name>/histograms/
     logger = TrainingLogger(save_dir, argparse.Namespace(**hparams), console_log=False)
 
-    # --- Layer evaluations ---
-    encoder_stats = eval_layer(
-        layer_fn=lambda imgs: model.encode(imgs),
-        loader=val_loader,
-        name="encoder_out",
-        logger=logger,
-        epoch=epoch,
-        device=device,
-    )
+    projector_type = hparams.get("projector", "mlp")
+    per_class_dir  = save_dir / "per_class_stats"
 
-    proj_stats = eval_layer(
-        layer_fn=lambda imgs: model.projector(model.encode(imgs)),
-        loader=val_loader,
-        name="proj_out",
-        logger=logger,
-        epoch=epoch,
-        device=device,
-    )
+    # --- Layer evaluations ---
+    def _run_layer(name: str, layer_fn: Callable[[torch.Tensor], torch.Tensor]) -> dict:
+        stats = eval_layer(layer_fn, val_loader, name, logger, epoch, device)
+        compute_per_class_stats(layer_fn, val_loader, num_classes,
+                                per_class_dir / f"{name}_{epoch:04d}.npz", device)
+        return stats
+
+    encoder_stats = _run_layer("encoder_out", lambda imgs: model.encode(imgs))
+
+    proj_stats: dict = {}
+    if projector_type != "none":
+        # Intermediate hidden layer: up to and including the ReLU
+        # mlp    → Sequential[Linear, ReLU, Linear]          → [:2]
+        # mlp-bn → Sequential[Linear, BN, ReLU, Linear, BN] → [:3]
+        hidden_slice = 2 if projector_type == "mlp" else 3
+        proj_hidden_fn = lambda imgs, s=hidden_slice: model.projector[:s](model.encode(imgs))  # type: ignore[index]
+
+        proj_stats = {
+            **_run_layer("proj_hidden", proj_hidden_fn),
+            **_run_layer("proj_out",   lambda imgs: model.projector(model.encode(imgs))),
+        }
 
     # --- kNN accuracy ---
     knn_acc1, knn_acc5 = knn_accuracy(
@@ -244,7 +406,7 @@ def main():
         "knn_acc5":        knn_acc5,
         **probe_stats,
         **encoder_stats,
-        **proj_stats,
+        **proj_stats,   # empty when projector == "none"
     }
 
     col_w = max(len(k) for k in metrics) + 2

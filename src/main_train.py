@@ -268,8 +268,8 @@ def parse_args():
     )
     p.add_argument("--name",            required=True,
                    help="Run name. Results saved to saves/<name>/.")
-    p.add_argument("--method",          default="simclr",  choices=["simclr", "byol"],
-                   help="SSL method. byol is not yet implemented.")
+    p.add_argument("--method",          default="simclr",  choices=["simclr"],
+                   help="SSL method.")
     p.add_argument("--dataset",         default="cifar100", choices=["cifar100", "tinyimagenet"])
     p.add_argument("--data-root",       default="./data")
     p.add_argument("--num-workers",     default=4,          type=int)
@@ -277,8 +277,6 @@ def parse_args():
     p.add_argument("--proj-output-dim", default=128,        type=int)
     p.add_argument("--projector",       default="mlp",      choices=["none", "mlp", "mlp-bn"],
                    help="Projection head variant: none (identity), mlp (linear-relu-linear), mlp-bn (SimCLR paper, BN after each linear).")
-    p.add_argument("--pred-hidden-dim", default=512,        type=int,
-                   help="BYOL predictor hidden dim (reserved).")
     p.add_argument("--max-epochs",      default=200,        type=int)
     p.add_argument("--warmup-epochs",   default=10,         type=int)
     p.add_argument("--batch-size",      default=256,        type=int)
@@ -287,7 +285,7 @@ def parse_args():
     p.add_argument("--weight-decay",    default=1e-4,       type=float)
     p.add_argument("--classifier-lr",  default=0.1,        type=float,
                    help="Learning rate for the online linear classifier optimizer.")
-    p.add_argument("--temperature",     default=0.5,        type=float,
+    p.add_argument("--temperature",     default=0.1,        type=float,
                    help="NT-Xent temperature. SimCLR paper optimum: 0.5.")
     p.add_argument("--precision",       default="32",       choices=["32", "16", "16-mixed", "bf16-mixed"])
     p.add_argument("--seed",            default=42,         type=int)
@@ -301,10 +299,7 @@ def parse_args():
                    help="Disable tqdm progress bars inside each epoch.")
     p.set_defaults(compile=True, console_log=True, tqdm=True)
 
-    args = p.parse_args()
-    if args.method == "byol":
-        p.error("--method byol is not yet implemented.")
-    return args
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------

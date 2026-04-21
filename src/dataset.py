@@ -42,20 +42,6 @@ def _simclr_aug(image_size: int, normalize: transforms.Normalize) -> transforms.
             normalize
         ])
 
-def _byol_aug(image_size: int, normalize: transforms.Normalize) -> tuple[transforms.Compose, transforms.Compose]:
-    ks = int(0.1 * image_size)
-    if ks % 2 == 0:
-        ks += 1
-    shared = [
-        transforms.RandomResizedCrop(image_size, scale=(0.08, 1.0)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
-        transforms.RandomGrayscale(p=0.2),
-    ]
-    view1 = transforms.Compose([*shared, transforms.GaussianBlur(kernel_size=ks, sigma=(0.1, 2.0)), transforms.ToTensor(), normalize])
-    view2 = transforms.Compose([*shared, transforms.RandomApply([transforms.GaussianBlur(kernel_size=ks, sigma=(0.1, 2.0))], p=0.1), transforms.RandomSolarize(threshold=128, p=0.2), transforms.ToTensor(), normalize])
-    return view1, view2
-
 
 def _clean_transform(image_size: int, normalize: transforms.Normalize) -> transforms.Compose:
     return transforms.Compose([
@@ -120,7 +106,7 @@ class TinyImageNetDataset(Dataset):
 def load_dataset(
     dataset: Literal["cifar100", "tinyimagenet"],
     two_view: bool,
-    augment: Literal["simclr", "byol"] | None,
+    augment: Literal["simclr"] | None,
     train: bool,
     batch_size: int,
     num_workers: int = 4,
@@ -132,8 +118,8 @@ def load_dataset(
         dataset:    "cifar100" or "tinyimagenet"
         two_view:   True  → yields (view1, view2, label) for SSL training
                     False → yields (image, label)
-        augment:    "simclr" / "byol" → apply that augmentation pipeline
-                    None              → clean center-crop (eval)
+        augment:    "simclr" → apply SimCLR augmentation pipeline
+                    None     → clean center-crop (eval)
         train:      True  → training split, shuffled, drop_last=True
                     False → val split, not shuffled
         batch_size: Batch size
@@ -151,12 +137,8 @@ def load_dataset(
         base = TinyImageNetDataset(split="train" if train else "valid")
 
     if augment and two_view:
-        if augment == "simclr":
-            t = _simclr_aug(image_size, normalize)
-            ds: Dataset = _TwoViewDataset(base, t, t)
-        else:
-            t1, t2 = _byol_aug(image_size, normalize)
-            ds = _TwoViewDataset(base, t1, t2)
+        t = _simclr_aug(image_size, normalize)
+        ds: Dataset = _TwoViewDataset(base, t, t)
     else:
         transform = _simclr_aug(image_size, normalize) if augment else _clean_transform(image_size, normalize)
         base.transform = transform  # type: ignore
