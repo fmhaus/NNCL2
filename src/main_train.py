@@ -72,13 +72,21 @@ def _topk_accuracy(logits: torch.Tensor, labels: torch.Tensor, topk=(1, 5)) -> l
 # Training
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, device, autocast, scaler, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def train_epoch(
+    model, backbone_classifier, proj_classifier,
+    loader, criterion, optimizer, scheduler,
+    device, autocast, scaler,
+    has_projector: bool,
+    use_tqdm: bool = False, epoch: int = 0,
+) -> dict:
     model.train()
-    classifier.train()
+    backbone_classifier.train()
+    if proj_classifier is not None:
+        proj_classifier.train()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
-    sum_nce = sum_cls = 0.0
-    sum_acc1 = sum_acc5 = n_samples = 0
+    sum_nce = sum_backbone_cls = sum_proj_cls = 0.0
+    sum_acc1 = sum_acc5 = sum_proj_acc1 = sum_proj_acc5 = n_samples = 0
     sum_grad_feat = sum_grad_proj_out = 0.0
 
     for view1, view2, labels in _wrap_tqdm(loader, use_tqdm, desc=f"train [epoch {epoch}]", leave=False):
@@ -90,18 +98,28 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         _grad_proj_out = []
 
         with autocast:
-            feat1    = model.encode(view1)
-            feat2    = model.encode(view2)
-            proj_out = model.projector(feat1)
-            nce_loss = criterion(proj_out, model.projector(feat2))
-            # Classifier on both views averaged — 2× gradient signal per step
-            logits1  = classifier(feat1.detach())
-            logits2  = classifier(feat2.detach())
-            cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
-            loss     = nce_loss + cls_loss
+            feat1     = model.encode(view1)
+            feat2     = model.encode(view2)
+            proj_out1 = model.projector(feat1)
+            proj_out2 = model.projector(feat2)
+            nce_loss  = criterion(proj_out1, proj_out2)
+            # Backbone classifier on both views averaged — 2× gradient signal per step
+            logits1          = backbone_classifier(feat1.detach())
+            logits2          = backbone_classifier(feat2.detach())
+            backbone_cls_loss = (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels)) / 2
+
+            if has_projector:
+                proj_logits1  = proj_classifier(proj_out1.detach())
+                proj_logits2  = proj_classifier(proj_out2.detach())
+                proj_cls_loss = (F.cross_entropy(proj_logits1, labels) + F.cross_entropy(proj_logits2, labels)) / 2
+                loss          = nce_loss + backbone_cls_loss + proj_cls_loss
+            else:
+                proj_logits1  = None
+                proj_cls_loss = nce_loss.new_tensor(0.0)
+                loss          = nce_loss + backbone_cls_loss
 
         feat_hook     = feat1.register_hook(lambda g: _grad_feat.append(g.norm().item()))
-        proj_out_hook = proj_out.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
+        proj_out_hook = proj_out1.register_hook(lambda g: _grad_proj_out.append(g.norm().item()))
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -121,22 +139,32 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
         sum_grad_proj_out += _grad_proj_out[0] if _grad_proj_out else 0.0
 
         acc1, acc5 = _topk_accuracy(logits1.detach(), labels)
-        b          = labels.size(0)
-        sum_nce   += nce_loss.item()
-        sum_cls   += cls_loss.item()
-        sum_acc1  += acc1 * b
-        sum_acc5  += acc5 * b
+        b = labels.size(0)
+        sum_nce          += nce_loss.item()
+        sum_backbone_cls += backbone_cls_loss.item()
+        sum_acc1         += acc1 * b
+        sum_acc5         += acc5 * b
+        if has_projector and proj_logits1 is not None:
+            proj_acc1, proj_acc5 = _topk_accuracy(proj_logits1.detach(), labels)
+            sum_proj_cls  += proj_cls_loss.item()
+            sum_proj_acc1 += proj_acc1 * b
+            sum_proj_acc5 += proj_acc5 * b
         n_samples += b
 
     n = len(loader)
-    return {
-        "train_nce_loss":      sum_nce          / n,
-        "train_class_loss":    sum_cls          / n,
-        "grad_feat_norm":      sum_grad_feat     / n,
-        "grad_proj_out_norm":  sum_grad_proj_out / n,
-        "train_acc1_epoch":    sum_acc1 / n_samples,
-        "train_acc5_epoch":    sum_acc5 / n_samples,
+    result = {
+        "train_nce_loss":          sum_nce          / n,
+        "train_backbone_cls_loss": sum_backbone_cls / n,
+        "grad_feat_norm":          sum_grad_feat     / n,
+        "grad_proj_out_norm":      sum_grad_proj_out / n,
+        "train_backbone_acc1":     sum_acc1 / n_samples,
+        "train_backbone_acc5":     sum_acc5 / n_samples,
     }
+    if has_projector:
+        result["train_proj_cls_loss"] = sum_proj_cls  / n
+        result["train_proj_acc1"]     = sum_proj_acc1 / n_samples
+        result["train_proj_acc5"]     = sum_proj_acc5 / n_samples
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -144,18 +172,21 @@ def train_epoch(model, classifier, loader, criterion, optimizer, scheduler, devi
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, epoch: int = 0) -> dict:
+def eval_classifier(
+    model, feature_fn, classifier, loader, device,
+    prefix: str = "backbone", use_tqdm: bool = False, epoch: int = 0,
+) -> dict:
     model.eval()
     classifier.eval()
     is_cuda = next(model.parameters()).device.type == "cuda"
 
     sum_loss = sum_acc1 = sum_acc5 = sum_l1 = sum_l2 = sum_hoyer = n_samples = 0
 
-    for images, labels in _wrap_tqdm(loader, use_tqdm, desc=f"val [epoch {epoch}]", leave=False):
+    for images, labels in _wrap_tqdm(loader, use_tqdm, desc=f"val [{prefix}] [epoch {epoch}]", leave=False):
         images = images.to(device, non_blocking=is_cuda)
         labels = labels.to(device, non_blocking=is_cuda)
 
-        feats     = model.encode(images)
+        feats     = feature_fn(images)
         logits    = classifier(feats)
         sum_loss += F.cross_entropy(logits, labels).item()
 
@@ -172,12 +203,12 @@ def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, e
         n_samples += b
 
     return {
-        "val_loss":    sum_loss  / len(loader),
-        "val_acc1":    sum_acc1  / n_samples,
-        "val_acc5":    sum_acc5  / n_samples,
-        "feat_l1":     sum_l1   / n_samples,
-        "feat_l2":     sum_l2   / n_samples,
-        "feat_hoyer":  sum_hoyer / n_samples,
+        f"{prefix}_val_loss":   sum_loss  / len(loader),
+        f"{prefix}_val_acc1":   sum_acc1  / n_samples,
+        f"{prefix}_val_acc5":   sum_acc5  / n_samples,
+        f"{prefix}_feat_l1":    sum_l1   / n_samples,
+        f"{prefix}_feat_l2":    sum_l2   / n_samples,
+        f"{prefix}_feat_hoyer": sum_hoyer / n_samples,
     }
 
 
@@ -187,7 +218,7 @@ def eval_classifier(model, classifier, loader, device, use_tqdm: bool = False, e
 
 @torch.no_grad()
 def knn_accuracy(
-    model, train_loader, val_loader, device,
+    model, feature_fn, train_loader, val_loader, device,
     k: int = 20, temperature: float = 0.07, use_tqdm: bool = False, epoch: int = 0,
 ) -> tuple[float, float]:
     """Returns (top-1 kNN acc, top-5 kNN acc)."""
@@ -197,7 +228,7 @@ def knn_accuracy(
     def extract(loader, desc):
         feats, labels = [], []
         for images, targets in _wrap_tqdm(loader, use_tqdm, desc=desc, leave=False):
-            feats.append(model.encode(images.to(device, non_blocking=is_cuda)))
+            feats.append(feature_fn(images.to(device, non_blocking=is_cuda)))
             labels.append(targets.to(device, non_blocking=is_cuda))
         return torch.cat(feats), torch.cat(labels)
 
@@ -230,25 +261,29 @@ def knn_accuracy(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _checkpoint_state(epoch, model, classifier, optimizer, scheduler, scaler, args) -> dict:
+def _checkpoint_state(epoch, model, backbone_classifier, proj_classifier, optimizer, scheduler, scaler, args) -> dict:
     state = {
-        "epoch":      epoch,
-        "model":      model.state_dict(),
-        "classifier": classifier.state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "scheduler":  scheduler.state_dict(),
-        "args":       vars(args),
+        "epoch":               epoch,
+        "model":               model.state_dict(),
+        "backbone_classifier": backbone_classifier.state_dict(),
+        "optimizer":           optimizer.state_dict(),
+        "scheduler":           scheduler.state_dict(),
+        "args":                vars(args),
     }
+    if proj_classifier is not None:
+        state["proj_classifier"] = proj_classifier.state_dict()
     if scaler is not None:
         state["scaler"] = scaler.state_dict()
     return state
 
 
-def load_checkpoint(path, model, classifier, optimizer, scheduler, scaler) -> int:
+def load_checkpoint(path, model, backbone_classifier, proj_classifier, optimizer, scheduler, scaler) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
-    if "classifier" in ckpt:
-        classifier.load_state_dict(ckpt["classifier"])
+    if "backbone_classifier" in ckpt:
+        backbone_classifier.load_state_dict(ckpt["backbone_classifier"])
+    if proj_classifier is not None and "proj_classifier" in ckpt:
+        proj_classifier.load_state_dict(ckpt["proj_classifier"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
@@ -277,6 +312,8 @@ def parse_args():
     p.add_argument("--proj-output-dim", default=128,        type=int)
     p.add_argument("--projector",       default="mlp",      choices=["none", "mlp", "mlp-bn"],
                    help="Projection head variant: none (identity), mlp (linear-relu-linear), mlp-bn (SimCLR paper, BN after each linear).")
+    p.add_argument("--non-neg",         action="store_true", dest="non_neg",
+                   help="Append ReLUGeLUGrad to projector end (non-negative features). No-op when --projector none.")
     p.add_argument("--max-epochs",      default=200,        type=int)
     p.add_argument("--warmup-epochs",   default=10,         type=int)
     p.add_argument("--batch-size",      default=256,        type=int)
@@ -297,7 +334,7 @@ def parse_args():
                    help="Suppress per-epoch metric printing.")
     p.add_argument("--no-tqdm",         action="store_false", dest="tqdm",
                    help="Disable tqdm progress bars inside each epoch.")
-    p.set_defaults(compile=True, console_log=True, tqdm=True)
+    p.set_defaults(compile=True, console_log=True, tqdm=True, non_neg=False)
 
     return p.parse_args()
 
@@ -365,10 +402,20 @@ def main():
     knn_train    = get_data_loader(two_view=False, augment=None,        train=True)
     knn_val      = get_data_loader(two_view=False, augment=None,        train=False)
 
-    # --- Model, classifier, loss, optimiser ---
-    model      = SimCLRModel(proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim, image_size=image_size, projector=args.projector).to(device)
-    classifier = LinearClassifier(num_classes=num_classes).to(device)
-    criterion  = NTXentLoss(temperature=args.temperature)
+    # --- Model, classifiers, loss, optimiser ---
+    has_projector = args.projector != "none"
+    non_neg       = getattr(args, "non_neg", False)
+
+    model               = SimCLRModel(
+        proj_hidden=args.proj_hidden_dim, proj_dim=args.proj_output_dim,
+        image_size=image_size, projector=args.projector, non_neg=non_neg,
+    ).to(device)
+    backbone_classifier = LinearClassifier(num_classes=num_classes).to(device)
+    proj_classifier     = (
+        LinearClassifier(num_classes=num_classes, input_dim=args.proj_output_dim).to(device)
+        if has_projector else None
+    )
+    criterion = NTXentLoss(temperature=args.temperature)
 
     # Exclude normalization layers and biases from weight decay
     _norm_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)
@@ -385,14 +432,15 @@ def main():
                 else:
                     decay.append(p)
 
-    optimizer = SGD(
-        [
-            {"params": decay},
-            {"params": no_decay,                  "weight_decay": 0.0},
-            {"params": classifier.parameters(),   "weight_decay": 0.0, "lr": args.classifier_lr},
-        ],
-        lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
-    )
+    param_groups = [
+        {"params": decay},
+        {"params": no_decay,                         "weight_decay": 0.0},
+        {"params": backbone_classifier.parameters(), "weight_decay": 0.0, "lr": args.classifier_lr},
+    ]
+    if has_projector:
+        param_groups.append({"params": proj_classifier.parameters(), "weight_decay": 0.0, "lr": args.classifier_lr})
+
+    optimizer = SGD(param_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)
     scheduler = make_scheduler(optimizer, args.max_epochs * steps_per_epoch, args.warmup_epochs * steps_per_epoch)
     autocast  = make_autocast(args.precision, device)
@@ -400,44 +448,71 @@ def main():
 
     start_epoch = 0
     if resume_ckpt is not None:
-        start_epoch = load_checkpoint(resume_ckpt, model, classifier, optimizer, scheduler, scaler)
+        start_epoch = load_checkpoint(resume_ckpt, model, backbone_classifier, proj_classifier, optimizer, scheduler, scaler)
 
     # Keep uncompiled references for state dict I/O — torch.compile wraps the
     # module and _model.state_dict() returns mangled keys.
-    model_for_ckpt      = model
-    classifier_for_ckpt = classifier
+    model_for_ckpt               = model
+    backbone_classifier_for_ckpt = backbone_classifier
+    proj_classifier_for_ckpt     = proj_classifier
     if args.compile:
-        model      = torch.compile(model)
-        classifier = torch.compile(classifier)
+        model               = torch.compile(model)
+        backbone_classifier = torch.compile(backbone_classifier)
+        if proj_classifier is not None:
+            proj_classifier = torch.compile(proj_classifier)
 
     # --- Training loop ---
     for epoch in range(start_epoch, args.max_epochs):
-        t0             = time.perf_counter()
-        train_m        = train_epoch(model, classifier, train_loader, criterion, optimizer, scheduler, device, autocast, scaler, args.tqdm, epoch=epoch + 1)
-        knn_acc1, knn_acc5 = knn_accuracy(model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        val_m          = eval_classifier(model, classifier, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1)
-        epoch_time     = time.perf_counter() - t0
+        t0      = time.perf_counter()
+        train_m = train_epoch(
+            model, backbone_classifier, proj_classifier, train_loader, criterion,
+            optimizer, scheduler, device, autocast, scaler,
+            has_projector=has_projector, use_tqdm=args.tqdm, epoch=epoch + 1,
+        )
+        backbone_knn_acc1, backbone_knn_acc5 = knn_accuracy(
+            model, model.encode, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1,
+        )
+        backbone_val_m = eval_classifier(
+            model, model.encode, backbone_classifier, knn_val, device,
+            prefix="backbone", use_tqdm=args.tqdm, epoch=epoch + 1,
+        )
+        if has_projector:
+            proj_knn_acc1, proj_knn_acc5 = knn_accuracy(
+                model, model, knn_train, knn_val, device, use_tqdm=args.tqdm, epoch=epoch + 1,
+            )
+            proj_val_m = eval_classifier(
+                model, model, proj_classifier, knn_val, device,
+                prefix="proj", use_tqdm=args.tqdm, epoch=epoch + 1,
+            )
+        epoch_time = time.perf_counter() - t0
 
         metrics = {
-            "train_nce_loss":      train_m["train_nce_loss"],
-            "train_class_loss":    train_m["train_class_loss"],
-            "train_acc1_epoch":    train_m["train_acc1_epoch"],
-            "train_acc5_epoch":    train_m["train_acc5_epoch"],
-            "val_knn_acc1":        knn_acc1,
-            "val_knn_acc5":        knn_acc5,
-            "grad_feat_norm":      train_m["grad_feat_norm"],
-            "grad_proj_out_norm":  train_m["grad_proj_out_norm"],
-            "val_loss":            val_m["val_loss"],
-            "val_acc1":            val_m["val_acc1"],
-            "val_acc5":            val_m["val_acc5"],
-            "feat_l1":             val_m["feat_l1"],
-            "feat_l2":             val_m["feat_l2"],
-            "feat_hoyer":          val_m["feat_hoyer"],
-            "lr":                  scheduler.get_last_lr()[0],
-            "epoch_time_s":        epoch_time,
+            "train_nce_loss":          train_m["train_nce_loss"],
+            "train_backbone_cls_loss": train_m["train_backbone_cls_loss"],
+            "train_backbone_acc1":     train_m["train_backbone_acc1"],
+            "train_backbone_acc5":     train_m["train_backbone_acc5"],
+            "backbone_knn_acc1":       backbone_knn_acc1,
+            "backbone_knn_acc5":       backbone_knn_acc5,
+            "grad_feat_norm":          train_m["grad_feat_norm"],
+            "grad_proj_out_norm":      train_m["grad_proj_out_norm"],
+            **backbone_val_m,
+            "lr":                      scheduler.get_last_lr()[0],
+            "epoch_time_s":            epoch_time,
         }
+        if has_projector:
+            metrics.update({
+                "train_proj_cls_loss": train_m["train_proj_cls_loss"],
+                "train_proj_acc1":     train_m["train_proj_acc1"],
+                "train_proj_acc5":     train_m["train_proj_acc5"],
+                "proj_knn_acc1":       proj_knn_acc1,
+                "proj_knn_acc5":       proj_knn_acc5,
+                **proj_val_m,
+            })
         logger.log(epoch + 1, metrics)
-        logger.save_checkpoint(epoch + 1, _checkpoint_state(epoch + 1, model_for_ckpt, classifier_for_ckpt, optimizer, scheduler, scaler, args))
+        logger.save_checkpoint(
+            epoch + 1,
+            _checkpoint_state(epoch + 1, model_for_ckpt, backbone_classifier_for_ckpt, proj_classifier_for_ckpt, optimizer, scheduler, scaler, args),
+        )
 
     print("Training complete.")
 

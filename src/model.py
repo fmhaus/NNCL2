@@ -7,6 +7,12 @@ from torchvision.models import resnet18
 BACKBONE_DIM = 512  # ResNet18 output dimension
 
 
+class ReLUGeLUGrad(nn.Module):
+    """Non-negative activation: ReLU forward value, smooth GeLU gradient."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x.detach()) + F.gelu(x) - F.gelu(x.detach())
+
+
 class SimCLRModel(nn.Module):
     """ResNet18 encoder with a SimCLR projection head.
 
@@ -22,6 +28,7 @@ class SimCLRModel(nn.Module):
         proj_hidden: Hidden dim of the projection MLP (paper uses 2048 for ResNet50;
                      512 is standard for ResNet18).
         proj_dim:    Output dim of the projector (paper: 128).
+        non_neg:     Append ReLUGeLUGrad at the projector end. No-op when projector='none'.
     """
 
     def __init__(
@@ -30,6 +37,7 @@ class SimCLRModel(nn.Module):
         proj_dim: int = 128,
         image_size: int = 224,
         projector: str = "mlp",   # "none" | "mlp" | "mlp-bn"
+        non_neg: bool = False,
     ):
         super().__init__()
 
@@ -47,20 +55,26 @@ class SimCLRModel(nn.Module):
         if projector == "none":
             self.projector: nn.Module = nn.Identity()
         elif projector == "mlp":
-            self.projector = nn.Sequential(
+            layers: list[nn.Module] = [
                 nn.Linear(BACKBONE_DIM, proj_hidden),
                 nn.ReLU(inplace=True),
                 nn.Linear(proj_hidden, proj_dim),
-            )
+            ]
+            if non_neg:
+                layers.append(ReLUGeLUGrad())
+            self.projector = nn.Sequential(*layers)
         elif projector == "mlp-bn":
             # SimCLR paper: BN after each linear layer
-            self.projector = nn.Sequential(
+            layers = [
                 nn.Linear(BACKBONE_DIM, proj_hidden, bias=False),
                 nn.BatchNorm1d(proj_hidden),
                 nn.ReLU(inplace=True),
                 nn.Linear(proj_hidden, proj_dim, bias=False),
                 nn.BatchNorm1d(proj_dim),
-            )
+            ]
+            if non_neg:
+                layers.append(ReLUGeLUGrad())
+            self.projector = nn.Sequential(*layers)
         else:
             raise ValueError(f"Unknown projector '{projector}'. Choose: none, mlp, mlp-bn.")
 
@@ -69,7 +83,7 @@ class SimCLRModel(nn.Module):
         return self.projector(self.encode(x))
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns backbone embeddings after feature_transform. Shape: (B, 512)."""
+        """Returns backbone embeddings. Shape: (B, 512)."""
         return self.backbone(x).flatten(1)
 
 
@@ -78,9 +92,9 @@ class LinearClassifier(nn.Module):
     Linear head for linear probing or fine-tuning on top of a frozen SimCLR backbone.
     """
 
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, input_dim: int = BACKBONE_DIM):
         super().__init__()
-        self.fc = nn.Linear(BACKBONE_DIM, num_classes)
+        self.fc = nn.Linear(input_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
