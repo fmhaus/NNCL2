@@ -389,7 +389,7 @@ def compute_disentanglement(
 
     print("  extracting two-view train features...", end=" ", flush=True)
     z1_list, z2_list = [], []
-    for (x1, x2), _ in train_loader_two_view:
+    for x1, x2, _ in train_loader_two_view:
         z1_list.append(encode_fn(x1.to(device, non_blocking=is_cuda)).cpu())
         z2_list.append(encode_fn(x2.to(device, non_blocking=is_cuda)).cpu())
     z1 = torch.cat(z1_list).numpy()
