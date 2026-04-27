@@ -291,7 +291,7 @@ def parse_args():
     p.add_argument("--num-workers",     default=4,          type=int)
     p.add_argument("--proj-hidden-dim",    default=2048,        type=int)
     p.add_argument("--proj-output-dim",    default=128,        type=int)
-    p.add_argument("--projector",          default="mlp",      choices=["none", "mlp", "mlp-bn"],
+    p.add_argument("--projector",          default="mlp-bn",      choices=["none", "mlp", "mlp-bn"],
                    help="Projection head variant: none (identity), mlp (linear-relu-linear), mlp-bn (SimCLR paper, BN after each linear).")
     p.add_argument("--pred-hidden-dim", default=512,        type=int,
                    help="BYOL predictor hidden dim (reserved).")
