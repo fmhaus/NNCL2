@@ -399,10 +399,6 @@ def compute_disentanglement(
     D       = z1.shape[1]
     loss_fn = NTXentLoss(temperature)
 
-    # EA ranking — computed once, used for all SEPIN@k
-    ea         = compute_ea(z1)
-    ea_rank    = np.argsort(ea)[::-1].copy()   # dim indices sorted highest EA first
-
     nce_full = _batched_nce(z1, z2, loss_fn, nce_batch_size, device)
     print(f"  NTXent full (D={D}): {nce_full:.4f}")
 
@@ -413,8 +409,8 @@ def compute_disentanglement(
         mask      = all_dims != i
         deltas[i] = _batched_nce(z1[:, mask], z2[:, mask], loss_fn, nce_batch_size, device) - nce_full
 
-    # deltas ranked by EA (highest EA first)
-    deltas_ranked = deltas[ea_rank]   # (D,) — position j = EA rank j
+    # rank by delta descending — most informative dimensions first
+    deltas_ranked = np.sort(deltas)[::-1]
 
     results: dict = {"nce_full": nce_full}
     for k in (1, 10, 100, D):
