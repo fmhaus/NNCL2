@@ -421,6 +421,9 @@ def compute_disentanglement(
         label = "all" if k == D else str(k)
         results[f"sepin_{label}"] = float(deltas_ranked[:k].mean())
 
+    print(f"  SEPIN@1={results['sepin_1']:.4f}  @10={results['sepin_10']:.4f}"
+          f"  @100={results['sepin_100']:.4f}  @all={results['sepin_all']:.4f}")
+
     return results
 
 
