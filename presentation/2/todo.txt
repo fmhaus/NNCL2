@@ -17,4 +17,4 @@ explain
 
 (maybe, try plot similarity histogram)
 
-Without L2 normalization, the contrastive task accuracy is higher, but the resulting representation is worse under linear evaluation.
+! Without L2 normalization, the contrastive task accuracy is higher, but the resulting representation is worse under linear evaluation.

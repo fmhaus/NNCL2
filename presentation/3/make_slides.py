@@ -3,6 +3,7 @@
 import io
 import pathlib
 import subprocess
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -112,46 +113,15 @@ def add_text(slide, text, left, top, width, height,
     r.font.color.rgb = color
     return tb
 
-
-# Conservative character width at 11pt (inches). Errs wide to avoid overflow.
-_CHAR_W_11PT = 0.082
-
 def draw_bullets(slide, bullets, left, top, width, blh,
-                 size=11, color=TEXT, indent=Inches(0.18)):
-    """Draw bullet list, splitting long lines at word boundaries.
-
-    Each visual line gets its own BLH-height box, so nothing ever overlaps.
-    Continuation lines are indented to align with the first-line text.
-    Returns the y position after the last line.
-    """
-    inner_w_in = (width - 2 * indent) / 914400   # EMU → inches
-    prefix     = "\u2022  "                        # 3 chars rendered in the box
-    cont       = "    "
-    # First line loses chars to the bullet prefix; continuations lose chars to indent
-    max_first = max(8, int(inner_w_in / _CHAR_W_11PT) - len(prefix))
-    max_cont  = max(8, int(inner_w_in / _CHAR_W_11PT) - len(cont))
-    y = top
-    for bullet in bullets:
-        words = bullet.split()
-        lines: list[str] = []
-        cur   = ""
-        limit = max_first
-        for word in words:
-            candidate = (cur + " " + word).strip()
-            if cur and len(candidate) > limit:
-                lines.append(cur)
-                cur   = word
-                limit = max_cont
-            else:
-                cur = candidate
-        if cur:
-            lines.append(cur)
-        for i, line in enumerate(lines):
-            add_text(slide, (prefix if i == 0 else cont) + line,
-                     left + indent, y, width - 2 * indent, blh,
-                     size=size, color=color, wrap=False)
-            y += blh
-    return y
+                 size=11, color=TEXT, indent=Inches(0.18), line_spacing=1.2):
+    """Single textbox, all bullets in one paragraph separated by line breaks."""
+    text = "\n".join("•  " + b for b in bullets)
+    n = len(bullets)
+    tb = add_text(slide, text, left + indent, top, width - 2 * indent, blh * n,
+                  size=size, color=color, wrap=True)
+    tb.text_frame.paragraphs[0].line_spacing = line_spacing
+    return top + blh * n
 
 
 def page_header(slide, title):
@@ -174,11 +144,10 @@ def card(slide, left, top, width, height, title=None, items=None,
                  size=title_size, bold=True, color=ACCENT)
         y += Inches(0.38)
     if items:
-        for item in items:
-            add_text(slide, f"  {item}", left + Inches(0.15), y,
-                     width - Inches(0.3), Inches(0.36),
-                     size=item_size, color=item_color)
-            y += Inches(0.34)
+        text = "\n".join(f"  {item}" for item in items)
+        add_text(slide, text, left + Inches(0.15), y,
+                 width - Inches(0.3), height - (y - top) - Inches(0.1),
+                 size=item_size, color=item_color, wrap=True)
 
 
 # ── Slide 1 – Objectives ──────────────────────────────────────────────────────
@@ -223,18 +192,23 @@ def slide_objectives(prs):
 
     def draw_card(lft, top, width, label, what, why):
         add_rect(slide, lft, top, width, row_h, fill_color=BOX_BG)
-        add_text(slide, label,
-                 lft + Inches(0.18), top + Inches(0.1),
-                 width - Inches(0.36), Inches(0.32),
-                 size=14, bold=True, color=ACCENT)
-        add_text(slide, what,
-                 lft + Inches(0.18), top + Inches(0.44),
-                 width - Inches(0.36), Inches(0.34),
-                 size=13, color=TEXT, wrap=True)
-        add_text(slide, why,
-                 lft + Inches(0.18), top + Inches(0.82),
-                 width - Inches(0.36), row_h - Inches(0.94),
-                 size=12, color=SUBTEXT, wrap=True)
+        tb = slide.shapes.add_textbox(
+            lft + Inches(0.18), top + Inches(0.1),
+            width - Inches(0.36), row_h - Inches(0.2))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        for i, (text, size, bold, clr) in enumerate([
+            (label, 14, True,  ACCENT),
+            (what,  13, False, TEXT),
+            (why,   12, False, SUBTEXT),
+        ]):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.alignment = PP_ALIGN.LEFT
+            r = p.add_run()
+            r.text = text
+            r.font.size = Pt(size)
+            r.font.bold = bold
+            r.font.color.rgb = clr
 
     # Rows 0 and 1: two columns each
     for i in range(4):
@@ -454,11 +428,12 @@ def slide_structure(prs):
         add_text(slide, title,
                  left + INNER, top + Inches(0.1), width - 2*INNER, Inches(0.28),
                  size=13, bold=True, color=ACCENT)
-        add_eq(slide, eq_latex, left + INNER, top + Inches(0.42))
-        y = top + Inches(0.42) + EQ_H + Inches(0.06)
+        y = top + Inches(0.42)
         if r_eq:
-            add_eq(slide, r_eq, left + INNER, y)
-            y += Inches(0.34) + Inches(0.08)
+            add_eq(slide, r_eq, left + INNER, y, height=EQ_H)
+            y += EQ_H + Inches(0.06)
+        add_eq(slide, eq_latex, left + INNER, y, height=EQ_H)
+        y += EQ_H + Inches(0.06)
         draw_bullets(slide, bullets, left, y, width, BLH)
 
     # Separability
@@ -475,8 +450,8 @@ def slide_structure(prs):
     # Disentanglement
     struct_card(sx(1), s_top, s_cw, s_h,
         "Disentanglement",
-        eq_latex=r"D_i = 1 - H_K(P_{i.})",
-        r_eq=None,
+        eq_latex=r"D_i = 1 - \frac{H(P_{i.})}{\log K}",
+        r_eq=r"P_{ij} = \frac{R_{ij}}{\sum_k R_{ik}}",
         bullets=[
             "Does each latent feature only represent one class?",
             "R: (Latent x Class) matrix of relative importance",
@@ -489,8 +464,8 @@ def slide_structure(prs):
     # Completeness
     struct_card(sx(2), s_top, s_cw, s_h,
         "Completeness",
-        eq_latex=r"C_j = 1 - H_D(\tilde{P}_{.j})",
-        r_eq=None,
+        eq_latex=r"C_j = 1 - \frac{H(\tilde{P}_{.j})}{\log D}",
+        r_eq=r"\tilde{P}_{ij} = \frac{R_{ij}}{\sum_k R_{kj}}",
         bullets=[
             "Is each class only explained by a single latent feature?",
             "Mirrored to disentanglement: 1 - entropy of per-class (normalized) relative importances",
@@ -516,11 +491,12 @@ def main():
     prs.save(out)
     print(f"Saved → {out}")
 
+    lookup = "where" if sys.platform == "win32" else "which"
     lo = next(
         (p for p in ["soffice", "libreoffice",
                      "/opt/homebrew/bin/soffice",
                      "/Applications/LibreOffice.app/Contents/MacOS/soffice"]
-         if subprocess.run(["which", p], capture_output=True).returncode == 0
+         if subprocess.run([lookup, p], capture_output=True).returncode == 0
          or pathlib.Path(p).exists()),
         None,
     )
