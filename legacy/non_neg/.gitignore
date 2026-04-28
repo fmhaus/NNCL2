@@ -9,7 +9,8 @@ wandb*/
 auto_umap/
 
 # datasets dir
-data/
+/data/
+!solo/data/
 *.pyc
 # saved models
 *.pt
