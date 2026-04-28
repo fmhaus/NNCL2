@@ -208,7 +208,7 @@ def load_legacy_checkpoint(ckpt_path: Path, run_args: dict) -> Tuple[LegacySimCL
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction
+# Feature extraction — tensors stay on device throughout
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -217,21 +217,21 @@ def _extract_val_features(
     loader: DataLoader,
     device: torch.device,
     hidden_slice: int,
-) -> dict:
-    is_cuda = device.type == "cuda"
+) -> Dict[str, torch.Tensor]:
+    nb = device.type == "cuda"
     enc_list, hidden_list, proj_list, label_list = [], [], [], []
     for images, labels in loader:
-        images = images.to(device, non_blocking=is_cuda)
+        images = images.to(device, non_blocking=nb)
         enc    = model.encode(images)
-        enc_list.append(enc.cpu())
-        hidden_list.append(model.projector[:hidden_slice](enc).cpu())
-        proj_list.append(model.projector(enc).cpu())
-        label_list.append(labels)
+        enc_list.append(enc)
+        hidden_list.append(model.projector[:hidden_slice](enc))
+        proj_list.append(model.projector(enc))
+        label_list.append(labels.to(device, non_blocking=nb))
     return {
-        "encoder":     torch.cat(enc_list).numpy(),
-        "proj_hidden": torch.cat(hidden_list).numpy(),
-        "proj":        torch.cat(proj_list).numpy(),
-        "labels":      torch.cat(label_list).numpy(),
+        "encoder":     torch.cat(enc_list),
+        "proj_hidden": torch.cat(hidden_list),
+        "proj":        torch.cat(proj_list),
+        "labels":      torch.cat(label_list),
     }
 
 
@@ -240,27 +240,26 @@ def _extract_with_labels(
     encode_fn: Callable[[torch.Tensor], torch.Tensor],
     loader: DataLoader,
     device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray]:
-    is_cuda = device.type == "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nb = device.type == "cuda"
     feat_list, label_list = [], []
     for images, labels in loader:
-        images = images.to(device, non_blocking=is_cuda)
-        feat_list.append(encode_fn(images).cpu())
-        label_list.append(labels)
-    return torch.cat(feat_list).numpy(), torch.cat(label_list).numpy()
+        feat_list.append(encode_fn(images.to(device, non_blocking=nb)))
+        label_list.append(labels.to(device, non_blocking=nb))
+    return torch.cat(feat_list), torch.cat(label_list)
 
 
 # ---------------------------------------------------------------------------
 # Sparsity metrics
 # ---------------------------------------------------------------------------
 
-def sparsity(features: np.ndarray) -> Dict[str, float]:
+def sparsity(features: torch.Tensor) -> Dict[str, float]:
     N, D = features.shape
-    l1 = np.abs(features).sum(axis=1)
-    l2 = np.sqrt((features ** 2).sum(axis=1))
-    hoyer    = ((D ** 0.5 - l1 / np.maximum(l2, 1e-8)) / (D ** 0.5 - 1)).mean()
-    zero_pct = (np.abs(features) < 1e-5).mean()
-    return {"hoyer": float(hoyer), "zero_pct": float(zero_pct)}
+    l1 = features.abs().sum(dim=1)
+    l2 = features.norm(dim=1)
+    hoyer    = ((D ** 0.5 - l1 / l2.clamp(min=1e-8)) / (D ** 0.5 - 1)).mean()
+    zero_pct = (features.abs() < 1e-5).float().mean()
+    return {"hoyer": hoyer.item(), "zero_pct": zero_pct.item()}
 
 
 # ---------------------------------------------------------------------------
@@ -268,39 +267,38 @@ def sparsity(features: np.ndarray) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def class_consistency(
-    features: np.ndarray,
-    labels: np.ndarray,
+    features: torch.Tensor,
+    labels: torch.Tensor,
     threshold: float = 1e-5,
 ) -> Dict[str, float]:
     N, D        = features.shape
-    num_classes = int(labels.max()) + 1
-    active      = features > threshold
-    n_active    = active.sum(axis=0)
-    one_hot     = np.zeros((N, num_classes), dtype=np.float32)
-    one_hot[np.arange(N), labels] = 1.0
-    count_per_class = one_hot.T @ active.astype(np.float32)
-    most_frequent   = count_per_class.max(axis=0)
-    rates           = most_frequent / np.maximum(n_active, 1)
-    return {"class_consistency": float(rates.mean())}
+    num_classes = int(labels.max().item()) + 1
+    active      = features > threshold                                   # (N, D)
+    n_active    = active.sum(dim=0)                                      # (D,)
+    one_hot     = torch.zeros(N, num_classes, device=features.device)
+    one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+    count_per_class = one_hot.T @ active.float()                         # (C, D)
+    most_frequent   = count_per_class.max(dim=0).values
+    rates           = most_frequent / n_active.float().clamp(min=1)
+    return {"class_consistency": rates.mean().item()}
 
 
 # ---------------------------------------------------------------------------
 # Dimensional correlation
 # ---------------------------------------------------------------------------
 
-def dim_correlation(features: np.ndarray, n_dims: int = 20, seed: int = 0) -> Dict:
-    N, D  = features.shape
-    rng   = np.random.default_rng(seed)
-    idx   = rng.choice(D, min(n_dims, D), replace=False)
-    F_sub  = features[:, idx]
-    norms  = np.sqrt((F_sub ** 2).sum(axis=0))
-    F_norm = F_sub / np.maximum(norms, 1e-8)
+def dim_correlation(features: torch.Tensor, n_dims: int = 20, seed: int = 0) -> Dict:
+    N, D = features.shape
+    idx  = np.random.default_rng(seed).choice(D, min(n_dims, D), replace=False)
+    idx_t  = torch.from_numpy(idx).long().to(features.device)
+    F_sub  = features[:, idx_t]
+    F_norm = F_sub / F_sub.norm(dim=0).clamp(min=1e-8)
     C      = F_norm.T @ F_norm
-    mask   = ~np.eye(C.shape[0], dtype=bool)
+    mask   = ~torch.eye(C.shape[0], dtype=torch.bool, device=C.device)
     return {
-        "dim_corr_matrix":       C,
+        "dim_corr_matrix":       C.cpu().numpy(),
         "dim_corr_indices":      idx,
-        "dim_corr_mean_offdiag": float(np.abs(C[mask]).mean()),
+        "dim_corr_mean_offdiag": C[mask].abs().mean().item(),
     }
 
 
@@ -308,70 +306,74 @@ def dim_correlation(features: np.ndarray, n_dims: int = 20, seed: int = 0) -> Di
 # Expected Activation
 # ---------------------------------------------------------------------------
 
-def compute_ea(train_features: np.ndarray) -> np.ndarray:
-    norms     = np.linalg.norm(train_features, axis=1, keepdims=True)
-    normalised = train_features / np.maximum(norms, 1e-8)
-    return normalised.mean(axis=0)
+def compute_ea(train_features: torch.Tensor) -> torch.Tensor:
+    norms     = train_features.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    return (train_features / norms).mean(dim=0)
 
 
 # ---------------------------------------------------------------------------
-# Linear probe
+# Linear probe — fully on-device, no DataLoader overhead
 # ---------------------------------------------------------------------------
 
 def _train_linear_probe(
-    train_feats:  np.ndarray,
-    train_labels: np.ndarray,
+    train_feats:  torch.Tensor,
+    train_labels: torch.Tensor,
     num_classes:  int,
     epochs:       int = 100,
     lr:           float = 0.1,
     batch_size:   int = 1024,
-    device:       torch.device = torch.device("cpu"),
 ) -> nn.Linear:
-    ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(train_feats).float(),
-        torch.from_numpy(train_labels).long(),
-    )
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
-    clf = nn.Linear(train_feats.shape[1], num_classes).to(device)
-    opt = torch.optim.SGD(clf.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+    N      = train_feats.shape[0]
+    device = train_feats.device
+    clf    = nn.Linear(train_feats.shape[1], num_classes, device=device)
+    opt    = torch.optim.SGD(clf.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
     clf.train()
     for _ in range(epochs):
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            F.cross_entropy(clf(xb), yb).backward()
+        perm = torch.randperm(N, device=device)
+        for i in range(0, N, batch_size):
+            idx = perm[i:i + batch_size]
+            F.cross_entropy(clf(train_feats[idx]), train_labels[idx]).backward()
             opt.step()
             opt.zero_grad()
     return clf
 
 
 @torch.no_grad()
-def _eval_accuracy(clf: nn.Linear, feats: np.ndarray, labels: np.ndarray) -> float:
+def _eval_accuracy(clf: nn.Linear, feats: torch.Tensor, labels: torch.Tensor) -> float:
     clf.eval()
-    X = torch.from_numpy(feats).float().to(next(clf.parameters()).device)
-    y = torch.from_numpy(labels).long().to(X.device)
-    return (clf(X).argmax(dim=1) == y).float().mean().item()
+    return (clf(feats).argmax(dim=1) == labels).float().mean().item()
 
 
-def _eval_map_at_k(feats: np.ndarray, labels: np.ndarray, k: int = 10) -> float:
+@torch.no_grad()
+def _eval_map_at_k(feats: torch.Tensor, labels: torch.Tensor, k: int = 10) -> float:
     N       = feats.shape[0]
-    norms   = np.linalg.norm(feats, axis=1, keepdims=True)
-    feats_n = feats / np.maximum(norms, 1e-8)
-    ap_sum  = 0.0
-    chunk   = 512
+    feats_n = F.normalize(feats.float(), dim=1)
+    arange_k = torch.arange(1, k + 1, dtype=torch.float32, device=feats.device)
+    # pre-compute number of relevant items per query (excluding self)
+    n_rel_all = torch.bincount(labels, minlength=int(labels.max().item()) + 1)[labels] - 1  # (N,)
+
+    ap_sum = 0.0
+    chunk  = 512
     for start in range(0, N, chunk):
-        end     = min(start + chunk, N)
-        sims    = feats_n[start:end] @ feats_n.T
-        for i in range(end - start):
-            sims[i, start + i] = -np.inf
-        top_idx = np.argsort(sims, axis=1)[:, -k:][:, ::-1]
-        for i in range(end - start):
-            ql    = labels[start + i]
-            n_rel = int((labels == ql).sum()) - 1
-            if n_rel == 0:
-                continue
-            hits  = (labels[top_idx[i]] == ql).astype(float)
-            prec  = np.cumsum(hits) / (np.arange(k) + 1)
-            ap_sum += (prec * hits).sum() / min(k, n_rel)
+        end  = min(start + chunk, N)
+        B    = end - start
+        sims = feats_n[start:end] @ feats_n.T                           # (B, N)
+
+        diag = torch.arange(B, device=feats.device)
+        sims[diag, start + diag] = float("-inf")
+
+        top_idx    = sims.topk(k, dim=1).indices                        # (B, k)
+        top_labels = labels[top_idx]                                     # (B, k)
+        q_labels   = labels[start:end]                                   # (B,)
+
+        hits  = (top_labels == q_labels.unsqueeze(1)).float()           # (B, k)
+        n_rel = n_rel_all[start:end]                                     # (B,)
+        denom = n_rel.clamp(max=k, min=1).float()
+
+        prec  = hits.cumsum(dim=1) / arange_k                           # (B, k)
+        ap    = (prec * hits).sum(dim=1) / denom                        # (B,)
+        ap_sum += ap[n_rel > 0].sum().item()
+
     return ap_sum / N
 
 
@@ -398,32 +400,32 @@ def evaluate_feature_subsets(
     val_feats, val_labels = _extract_with_labels(encode_fn, val_loader, device)
     print("done")
 
-    D       = train_feats.shape[1]
-    ea      = compute_ea(train_feats)
-    top_idx = np.argsort(ea)[-n_select:]
+    D   = train_feats.shape[1]
+    ea  = compute_ea(train_feats)
 
     rng      = np.random.default_rng(seed)
-    rand_idx = rng.choice(D, n_select, replace=False)
+    rand_idx = torch.from_numpy(rng.choice(D, n_select, replace=False)).long().to(device)
+    top_idx  = ea.argsort()[-n_select:]
 
     n = n_select
     subsets = [
-        ("all",        np.arange(D), False),
-        (f"rand{n}",   rand_idx,     False),
-        (f"ea{n}",     top_idx,      False),
-        (f"ea{n}relu", top_idx,      True),
+        ("all",        torch.arange(D, device=device), False),
+        (f"rand{n}",   rand_idx,                        False),
+        (f"ea{n}",     top_idx,                         False),
+        (f"ea{n}relu", top_idx,                         True),
     ]
 
     results: Dict = {}
     for name, idx, use_relu in subsets:
-        tr = train_feats[:, idx].copy()
-        vl = val_feats[:, idx].copy()
+        tr = train_feats[:, idx]
+        vl = val_feats[:, idx]
         if use_relu:
-            np.clip(tr, 0, None, out=tr)
-            np.clip(vl, 0, None, out=vl)
+            tr = tr.clamp(min=0)
+            vl = vl.clamp(min=0)
 
         print(f"  [{name:12s}] training probe...", end=" ", flush=True)
         clf   = _train_linear_probe(tr, train_labels, num_classes,
-                                    epochs=probe_epochs, lr=probe_lr, device=device)
+                                    epochs=probe_epochs, lr=probe_lr)
         print("done", end="  ")
 
         acc   = _eval_accuracy(clf, vl, val_labels)
@@ -440,16 +442,15 @@ def evaluate_feature_subsets(
 # SEPIN / disentanglement
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def _batched_nce(
-    z1: np.ndarray, z2: np.ndarray,
-    loss_fn: NTXentLoss, batch_size: int, device: torch.device,
+    z1: torch.Tensor, z2: torch.Tensor,
+    loss_fn: NTXentLoss, batch_size: int,
 ) -> float:
+    """NTXent averaged over mini-batches. z1/z2 must already be on the target device."""
     total, n_batches = 0.0, 0
     for start in range(0, len(z1), batch_size):
-        z1b = torch.from_numpy(z1[start:start + batch_size]).float().to(device)
-        z2b = torch.from_numpy(z2[start:start + batch_size]).float().to(device)
-        with torch.no_grad():
-            total += loss_fn(z1b, z2b).item()
+        total += loss_fn(z1[start:start + batch_size], z2[start:start + batch_size]).item()
         n_batches += 1
     return total / n_batches
 
@@ -463,34 +464,35 @@ def compute_disentanglement(
     nce_batch_size:        int   = 256,
 ) -> Dict:
     """SEPIN@1/10/100/all via leave-one-out NTXent on two-view train features."""
-    is_cuda = device.type == "cuda"
+    nb = device.type == "cuda"
     print("  extracting two-view train features...", end=" ", flush=True)
     z1_list, z2_list = [], []
     for x1, x2, _ in train_loader_two_view:
-        z1_list.append(encode_fn(x1.to(device, non_blocking=is_cuda)).cpu())
-        z2_list.append(encode_fn(x2.to(device, non_blocking=is_cuda)).cpu())
-    z1 = torch.cat(z1_list).numpy()
-    z2 = torch.cat(z2_list).numpy()
+        z1_list.append(encode_fn(x1.to(device, non_blocking=nb)))
+        z2_list.append(encode_fn(x2.to(device, non_blocking=nb)))
+    z1 = torch.cat(z1_list)   # (N, D) — stays on device
+    z2 = torch.cat(z2_list)
     print("done")
 
     D       = z1.shape[1]
     loss_fn = NTXentLoss(temperature)
 
-    nce_full = _batched_nce(z1, z2, loss_fn, nce_batch_size, device)
+    nce_full = _batched_nce(z1, z2, loss_fn, nce_batch_size)
     print(f"  NTXent full (D={D}): {nce_full:.4f}")
 
-    all_dims = np.arange(D)
-    deltas   = np.empty(D)
+    # Leave-one-out: index mask built on device, all slicing stays on device
+    all_idx = torch.arange(D, device=device)
+    deltas  = torch.empty(D)
     for i in range(D):
-        mask      = all_dims != i
-        deltas[i] = _batched_nce(z1[:, mask], z2[:, mask], loss_fn, nce_batch_size, device) - nce_full
+        keep      = torch.cat([all_idx[:i], all_idx[i + 1:]])
+        deltas[i] = _batched_nce(z1[:, keep], z2[:, keep], loss_fn, nce_batch_size) - nce_full
 
-    deltas_ranked = np.sort(deltas)[::-1]
+    deltas_ranked = deltas.sort(descending=True).values
 
     results: Dict = {"nce_full": nce_full}
     for k in (1, 10, 100, D):
         label = "all" if k == D else str(k)
-        results[f"sepin_{label}"] = float(deltas_ranked[:k].mean())
+        results[f"sepin_{label}"] = float(deltas_ranked[:k].mean().item())
 
     print(f"  SEPIN@1={results['sepin_1']:.4f}  @10={results['sepin_10']:.4f}"
           f"  @100={results['sepin_100']:.4f}  @all={results['sepin_all']:.4f}")
@@ -579,7 +581,7 @@ def main() -> None:
     # --- Val feature extraction ---
     print("\nExtracting val features...")
     features   = _extract_val_features(model, val_loader, device, hidden_slice)
-    val_labels = features["labels"].astype(int)
+    val_labels = features["labels"].long()
 
     layers = [
         ("encoder",     "encoder",
@@ -621,14 +623,19 @@ def main() -> None:
     print(f"\n{'Metric':<{col_w}} Value")
     print("-" * (col_w + 10))
     for k, v in results.items():
-        if isinstance(v, np.ndarray):
+        if isinstance(v, (np.ndarray, torch.Tensor)):
             continue
         print(f"{k:<{col_w}} {v:.4f}" if isinstance(v, float) else f"{k:<{col_w}} {v}")
 
     # --- Save metrics ---
+    def _to_numpy(v) -> np.ndarray:
+        if isinstance(v, torch.Tensor):
+            return v.cpu().numpy()
+        return np.asarray(v)
+
     metrics_path = ckpt_path.parent / "eval2_metrics" / f"metrics_{epoch:04d}.npz"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(metrics_path, **{k: np.array(v) for k, v in results.items()})
+    np.savez_compressed(metrics_path, **{k: _to_numpy(v) for k, v in results.items()})  # type: ignore[call-overload]
     print(f"\nSaved metrics → {metrics_path}")
 
 
