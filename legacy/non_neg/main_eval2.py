@@ -24,6 +24,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import resnet18
 
+from solo.losses.simclr import simclr_loss_func
+
 
 # ---------------------------------------------------------------------------
 # Normalization — matches pretrain pipeline (build_transform_pipeline cifar100)
@@ -113,24 +115,6 @@ def _cifar100_loader(
                       persistent_workers=num_workers > 0)
 
 
-# ---------------------------------------------------------------------------
-# NTXent loss (inline — avoids cross-project imports)
-# ---------------------------------------------------------------------------
-
-class NTXentLoss(nn.Module):
-    def __init__(self, temperature: float = 0.5):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        B = z1.size(0)
-        z1 = F.normalize(z1, dim=1)
-        z2 = F.normalize(z2, dim=1)
-        z   = torch.cat([z1, z2], dim=0)
-        sim = torch.mm(z, z.T) / self.temperature
-        sim = sim.masked_fill(torch.eye(2 * B, dtype=torch.bool, device=z.device), float("-inf"))
-        labels = torch.cat([torch.arange(B, 2 * B), torch.arange(B)]).to(z.device)
-        return F.cross_entropy(sim, labels)
 
 
 # ---------------------------------------------------------------------------
@@ -443,15 +427,25 @@ def evaluate_feature_subsets(
 # SEPIN / disentanglement
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def _batched_nce(
     z1: torch.Tensor, z2: torch.Tensor,
-    loss_fn: NTXentLoss, batch_size: int,
+    temperature: float, batch_size: int,
 ) -> float:
-    """NTXent averaged over mini-batches. z1/z2 must already be on the target device."""
+    """simclr_loss_func averaged over mini-batches.
+
+    z1/z2 are raw (unnormalized) features, already on the target device.
+    Each call mirrors training exactly:
+      cat views → F.normalize (full or sliced D) → indexes → simclr_loss_func
+    """
     total, n_batches = 0.0, 0
     for start in range(0, len(z1), batch_size):
-        total += loss_fn(z1[start:start + batch_size], z2[start:start + batch_size]).item()
+        z1b = z1[start:start + batch_size]
+        z2b = z2[start:start + batch_size]
+        B   = z1b.shape[0]
+        # cat views then normalize — same as training: z = F.normalize(cat(views), dim=-1)
+        z       = F.normalize(torch.cat([z1b, z2b], dim=0), dim=-1)
+        indexes = torch.arange(B, device=z.device).repeat(2)
+        total  += simclr_loss_func(z, indexes=indexes, temperature=temperature).item()
         n_batches += 1
     return total / n_batches
 
@@ -464,29 +458,35 @@ def compute_disentanglement(
     temperature:           float = 0.1,
     nce_batch_size:        int   = 256,
 ) -> Dict:
-    """SEPIN@1/10/100/all via leave-one-out NTXent on two-view train features."""
+    """SEPIN@1/10/100/all via leave-one-out NCE on two-view train features.
+
+    encode_fn must return raw (pre-normalization) projector outputs, matching the
+    point in training right before F.normalize is called.
+    Normalization is applied fresh inside each _batched_nce call — both for the
+    full-D baseline and for every (D-1)-dim leave-one-out slice.
+    """
     nb = device.type == "cuda"
     print("  extracting two-view train features...", end=" ", flush=True)
     z1_list, z2_list = [], []
     for x1, x2, _ in train_loader_two_view:
         z1_list.append(encode_fn(x1.to(device, non_blocking=nb)))
         z2_list.append(encode_fn(x2.to(device, non_blocking=nb)))
-    z1 = torch.cat(z1_list)   
+    # Keep raw (unnormalized) — normalization happens inside _batched_nce
+    z1 = torch.cat(z1_list)
     z2 = torch.cat(z2_list)
     print("done")
 
-    D       = z1.shape[1]
-    loss_fn = NTXentLoss(temperature)
+    D = z1.shape[1]
 
-    nce_full = _batched_nce(z1, z2, loss_fn, nce_batch_size)
-    print(f"  NTXent full (D={D}): {nce_full:.4f}")
+    nce_full = _batched_nce(z1, z2, temperature, nce_batch_size)
+    print(f"  NCE full (D={D}): {nce_full:.4f}")
 
-    # Leave-one-out: index mask built on device, all slicing stays on device
+    # Leave-one-out: slicing stays on device; _batched_nce re-normalizes the (D-1)-dim slice
     all_idx = torch.arange(D, device=device)
     deltas  = torch.empty(D)
     for i in range(D):
         keep      = torch.cat([all_idx[:i], all_idx[i + 1:]])
-        deltas[i] = _batched_nce(z1[:, keep], z2[:, keep], loss_fn, nce_batch_size) - nce_full
+        deltas[i] = _batched_nce(z1[:, keep], z2[:, keep], temperature, nce_batch_size) - nce_full
 
     deltas_ranked = deltas.sort(descending=True).values
 
@@ -502,6 +502,31 @@ def compute_disentanglement(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint discovery
+# ---------------------------------------------------------------------------
+
+def find_checkpoint(run_dir: Path, epoch: Optional[int] = None) -> Path:
+    """Return the checkpoint in run_dir with the highest epoch, or a specific epoch."""
+    ckpts = sorted(run_dir.glob("*.ckpt"))
+    if not ckpts:
+        raise SystemExit(f"No checkpoints found in '{run_dir}'.")
+
+    def _epoch(p: Path) -> int:
+        for part in p.stem.split("-"):
+            if part.startswith("ep="):
+                return int(part[3:])
+        return -1
+
+    if epoch is not None:
+        matches = [c for c in ckpts if _epoch(c) == epoch]
+        if not matches:
+            raise SystemExit(f"No checkpoint for epoch {epoch} in '{run_dir}'.")
+        return matches[0]
+
+    return max(ckpts, key=_epoch)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -510,8 +535,10 @@ def parse_args() -> argparse.Namespace:
         description="Offline evaluation v2 for legacy non_neg solo SimCLR checkpoints.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--ckpt", required=True,
-                   help="Path to .ckpt file (args.json must be in the same directory).")
+    p.add_argument("--path", required=True,
+                   help="Run directory, e.g. trained_models/simclr/hywyrz38")
+    p.add_argument("--epoch", default=None, type=int,
+                   help="Checkpoint epoch to evaluate. Default: highest available.")
     p.add_argument("--data-root", default=None,
                    help="Override CIFAR-100 data root from args.json.")
     p.add_argument("--num-workers", default=None, type=int,
@@ -530,13 +557,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    ckpt_path = Path(args.ckpt)
-    if not ckpt_path.exists():
-        raise SystemExit(f"Checkpoint not found: {ckpt_path}")
+    run_dir   = Path(args.path)
+    ckpt_path = find_checkpoint(run_dir, args.epoch)
 
-    args_path = ckpt_path.parent / "args.json"
+    args_path = run_dir / "args.json"
     if not args_path.exists():
-        raise SystemExit(f"args.json not found alongside checkpoint: {args_path}")
+        raise SystemExit(f"args.json not found in '{run_dir}'.")
 
     run_args = json.loads(args_path.read_text())
 
