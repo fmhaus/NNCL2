@@ -259,7 +259,8 @@ def sparsity(features: torch.Tensor) -> Dict[str, float]:
     l2 = features.norm(dim=1)
     hoyer    = ((D ** 0.5 - l1 / l2.clamp(min=1e-8)) / (D ** 0.5 - 1)).mean()
     zero_pct = (features.abs() < 1e-5).float().mean()
-    return {"hoyer": hoyer.item(), "zero_pct": zero_pct.item()}
+    dead_pct = ((features.abs() < 1e-5).all(dim=0)).float().mean()
+    return {"hoyer": hoyer.item(), "zero_pct": zero_pct.item(), "dead_pct": dead_pct.item()}
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +471,7 @@ def compute_disentanglement(
     for x1, x2, _ in train_loader_two_view:
         z1_list.append(encode_fn(x1.to(device, non_blocking=nb)))
         z2_list.append(encode_fn(x2.to(device, non_blocking=nb)))
-    z1 = torch.cat(z1_list)   # (N, D) — stays on device
+    z1 = torch.cat(z1_list)   
     z2 = torch.cat(z2_list)
     print("done")
 

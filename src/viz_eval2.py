@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.colors as mcolors
 
 
 LAYER_ORDER = ["encoder", "proj_hidden", "proj"]
@@ -25,13 +26,20 @@ def parse_args():
         description="Visualize eval2 metrics from a saved NPZ file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--name",  required=True,
+    p.add_argument("--name",  default=None,
                    help="Run name — points to saves/<name>/eval2_metrics/.")
     p.add_argument("--epoch", default=None, type=int,
-                   help="Epoch to load. Default: latest.")
+                   help="Epoch to load (used with --name). Default: latest.")
+    p.add_argument("--path",  default=None, metavar="NPZ_PATH",
+                   help="Direct path to a .npz file (overrides --name/--epoch).")
+    p.add_argument("--label", default=None,
+                   help="Override the title label shown in the figure.")
     p.add_argument("--save",  default=None, metavar="PATH",
                    help="Save figure to file instead of showing.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.path is None and args.name is None:
+        p.error("provide either --name or --path")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -84,23 +92,24 @@ def plot_scalars(ax, data, layer: str) -> None:
     items = [
         ("hoyer",         f"{layer}_hoyer"),
         ("zero_pct",      f"{layer}_zero_pct"),
+        ("dead_pct",      f"{layer}_dead_pct"),
         ("class_cons",    f"{layer}_class_consistency"),
     ]
     labels = [l for l, k in items if k in data.files]
-    values = [float(data[k]) for _, k in items if k in data.files]
+    values = [float(data[k]) * 100 for _, k in items if k in data.files]
 
     y      = np.arange(len(labels))
     colors = [ACCENT[i % len(ACCENT)] for i in range(len(labels))]
     bars   = ax.barh(y, values, color=colors, height=0.55)
-    ax.bar_label(bars, fmt="%.4f", padding=4, fontsize=8)
+    ax.bar_label(bars, fmt="%.2f%%", padding=4, fontsize=8)
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlim(0, max(values, default=1) * 1.35)
+    ax.set_xlim(0, 100)
     ax.set_title(f"{layer}", fontsize=10, fontweight="bold")
     ax.tick_params(axis="x", labelsize=7)
     ax.xaxis.grid(True, linewidth=0.4, alpha=0.5)
     ax.set_axisbelow(True)
-    ax.set_xlabel("value", fontsize=7)
+    ax.set_xlabel("%", fontsize=7)
 
 
 def plot_probe(ax, data, layer: str, n: int) -> None:
@@ -116,6 +125,7 @@ def plot_probe(ax, data, layer: str, n: int) -> None:
     ax.set_ylabel("%", fontsize=8)
     ax.tick_params(axis="y", labelsize=8)
     ax.yaxis.grid(True, linewidth=0.4, alpha=0.5, zorder=0)
+    ax.set_ylim(0, 100)
     ax.set_axisbelow(True)
     ax.legend(fontsize=7, loc="lower right")
     ax.set_title("probe acc & mAP@10", fontsize=9)
@@ -131,6 +141,7 @@ def plot_sepin(ax, data, layer: str) -> None:
     colors = [ACCENT[2] if v >= 0 else ACCENT[3] for v in values]
     ax.bar(x, values, color=colors, zorder=3)
     ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylim(0, 0.005)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9)
     ax.tick_params(axis="y", labelsize=8)
@@ -153,8 +164,11 @@ def plot_corr(ax, data, layer: str) -> None:
         ax.text(0.5, 0.5, "no matrix", ha="center", va="center",
                 transform=ax.transAxes, fontsize=9, color="grey")
         return
+    _wbw = mcolors.LinearSegmentedColormap.from_list(
+        "wbw", [(0.0, "white"), (0.5, "black"), (1.0, "white")]
+    )
     C  = data[key]
-    im = ax.imshow(C, aspect="auto", cmap="gray", vmin=-1, vmax=1, interpolation="nearest")
+    im = ax.imshow(C, aspect="auto", cmap=_wbw, vmin=-1, vmax=1, interpolation="nearest")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title("dim corr matrix", fontsize=9)
     ax.tick_params(labelsize=7)
@@ -166,7 +180,18 @@ def plot_corr(ax, data, layer: str) -> None:
 
 def main():
     args   = parse_args()
-    data   = load_data(args.name, args.epoch)
+    if args.path:
+        p = Path(args.path)
+        if not p.exists():
+            raise SystemExit(f"'{p}' not found.")
+        print(f"Loading '{p}'")
+        data  = np.load(p, allow_pickle=True)
+        label = p.stem
+    else:
+        data  = load_data(args.name, args.epoch)
+        label = args.name
+    if args.label:
+        label = args.label
     epoch  = int(data["epoch"]) if "epoch" in data.files else "?"
     layers = detect_layers(data)
 
@@ -175,7 +200,7 @@ def main():
 
     n = len(layers)
     fig = plt.figure(figsize=(5.5 * n, 17))
-    fig.suptitle(f"{args.name}  —  epoch {epoch}", fontsize=13, fontweight="bold", y=0.998)
+    fig.suptitle(f"{label}  —  epoch {epoch}", fontsize=13, fontweight="bold", y=0.998)
 
     gs = gridspec.GridSpec(
         4, n, figure=fig,

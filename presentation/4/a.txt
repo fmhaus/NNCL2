@@ -1,0 +1,3 @@
+fix dead neurons
+maybe loss to prevent dead neurons
+More rep_relu
