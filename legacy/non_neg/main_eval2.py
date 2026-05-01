@@ -28,11 +28,18 @@ from solo.losses.simclr import simclr_loss_func
 
 
 # ---------------------------------------------------------------------------
-# Normalization — matches pretrain pipeline (build_transform_pipeline cifar100)
+# Normalization — matches pretrain pipeline (build_transform_pipeline)
 # ---------------------------------------------------------------------------
 
-CIFAR100_MEAN = (0.5071, 0.4865, 0.4409)
-CIFAR100_STD  = (0.2673, 0.2564, 0.2762)
+CIFAR100_MEAN  = (0.5071, 0.4865, 0.4409)
+CIFAR100_STD   = (0.2673, 0.2564, 0.2762)
+IMAGENET_MEAN  = (0.485,  0.456,  0.406)
+IMAGENET_STD   = (0.229,  0.224,  0.225)
+
+_DATASET_STATS: Dict[str, Tuple] = {
+    "cifar100":    (CIFAR100_MEAN,  CIFAR100_STD),
+    "imagenet100": (IMAGENET_MEAN,  IMAGENET_STD),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +59,7 @@ class _TwoViewDataset(Dataset):
         return self.transform(img), self.transform(img), label
 
 
-def _build_aug_transform(aug_cfg: dict) -> transforms.Compose:
+def _build_aug_transform(aug_cfg: dict, mean: tuple, std: tuple) -> transforms.Compose:
     """Reconstruct the pretrain augmentation pipeline from args.json augmentation config."""
     import random as _random
     from PIL import ImageFilter
@@ -90,12 +97,14 @@ def _build_aug_transform(aug_cfg: dict) -> transforms.Compose:
         steps.append(transforms.RandomHorizontalFlip(p=aug_cfg["horizontal_flip"]["prob"]))
 
     steps.append(transforms.ToTensor())
-    steps.append(transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD))
+    steps.append(transforms.Normalize(mean, std))
     return transforms.Compose(steps)
 
 
-def _cifar100_loader(
-    data_root: str,
+def _make_loader(
+    dataset: str,
+    train_path: str,
+    val_path: str,
     train: bool,
     batch_size: int,
     num_workers: int,
@@ -103,14 +112,23 @@ def _cifar100_loader(
     two_view: bool = False,
 ) -> DataLoader:
     pin = torch.cuda.is_available()
+    shuffle = train or two_view
+
+    if dataset == "cifar100":
+        base = torchvision.datasets.CIFAR100(
+            train_path, train=True if two_view else train,
+            download=False, transform=None if two_view else transform,
+        )
+    else:
+        path = train_path if (train or two_view) else val_path
+        base = torchvision.datasets.ImageFolder(path, transform=None if two_view else transform)
+
     if two_view:
-        base = torchvision.datasets.CIFAR100(data_root, train=True, download=False, transform=None)
         ds: Dataset = _TwoViewDataset(base, transform)
-        return DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True,
-                          num_workers=num_workers, pin_memory=pin,
-                          persistent_workers=num_workers > 0)
-    ds = torchvision.datasets.CIFAR100(data_root, train=train, download=False, transform=transform)
-    return DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train,
+    else:
+        ds = base
+
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=shuffle,
                       num_workers=num_workers, pin_memory=pin,
                       persistent_workers=num_workers > 0)
 
@@ -540,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epoch", default=None, type=int,
                    help="Checkpoint epoch to evaluate. Default: highest available.")
     p.add_argument("--data-root", default=None,
-                   help="Override CIFAR-100 data root from args.json.")
+                   help="Override data train_path from args.json.")
     p.add_argument("--num-workers", default=None, type=int,
                    help="Override num_workers from args.json.")
     p.add_argument("--n-select", default=128, type=int,
@@ -582,18 +600,35 @@ def main() -> None:
     print(f"Device     : {device}")
 
     # --- Data ---
-    clean_t = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
-    ])
-    aug_t = _build_aug_transform(run_args["augmentations"][0])
+    dataset  = run_args["data"]["dataset"]
+    if dataset not in _DATASET_STATS:
+        raise SystemExit(f"Unsupported dataset '{dataset}'. Supported: {list(_DATASET_STATS)}")
+    mean, std = _DATASET_STATS[dataset]
 
-    val_loader      = _cifar100_loader(data_root, train=False, batch_size=batch_size,
-                                       num_workers=num_workers, transform=clean_t)
-    train_loader    = _cifar100_loader(data_root, train=True,  batch_size=batch_size,
-                                       num_workers=num_workers, transform=clean_t)
-    train_loader_tv = _cifar100_loader(data_root, train=True,  batch_size=batch_size,
-                                       num_workers=num_workers, transform=aug_t, two_view=True)
+    val_path = run_args["data"].get("val_path", data_root)
+
+    if dataset == "cifar100":
+        clean_t = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+    else:
+        clean_t = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+    aug_t = _build_aug_transform(run_args["augmentations"][0], mean, std)
+
+    val_loader      = _make_loader(dataset, data_root, val_path, train=False,
+                                   batch_size=batch_size, num_workers=num_workers, transform=clean_t)
+    train_loader    = _make_loader(dataset, data_root, val_path, train=True,
+                                   batch_size=batch_size, num_workers=num_workers, transform=clean_t)
+    train_loader_tv = _make_loader(dataset, data_root, val_path, train=True,
+                                   batch_size=batch_size, num_workers=num_workers,
+                                   transform=aug_t, two_view=True)
 
     # --- Model ---
     model, epoch = load_legacy_checkpoint(ckpt_path, run_args)

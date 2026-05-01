@@ -13,10 +13,9 @@ import torch
 from torchvision import transforms
 
 from main_eval2 import (
-    CIFAR100_MEAN,
-    CIFAR100_STD,
+    _DATASET_STATS,
     _build_aug_transform,
-    _cifar100_loader,
+    _make_loader,
     compute_disentanglement,
     find_checkpoint,
     load_legacy_checkpoint,
@@ -56,10 +55,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"ckpt={ckpt_path.name}  device={device}  layer={args.layer}  temperature={temperature}")
 
-    aug_t = _build_aug_transform(run_args["augmentations"][0])
-    train_loader_tv = _cifar100_loader(
-        data_root, train=True, batch_size=batch_size,
-        num_workers=num_workers, transform=aug_t, two_view=True,
+    dataset     = run_args["data"]["dataset"]
+    val_path    = run_args["data"].get("val_path", data_root)
+    mean, std   = _DATASET_STATS[dataset]
+    aug_t       = _build_aug_transform(run_args["augmentations"][0], mean, std)
+    train_loader_tv = _make_loader(
+        dataset, data_root, val_path, train=True,
+        batch_size=batch_size, num_workers=num_workers, transform=aug_t, two_view=True,
     )
 
     model, epoch = load_legacy_checkpoint(ckpt_path, run_args)
