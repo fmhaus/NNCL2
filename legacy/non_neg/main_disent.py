@@ -7,7 +7,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
 import torch
 from torchvision import transforms
@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layer",  required=True, choices=LAYERS)
     p.add_argument("--epoch",  default=None, type=int,
                    help="Checkpoint epoch. Default: highest available.")
+    p.add_argument("--data-root",      default=None)
+    p.add_argument("--num-workers",    default=None, type=int)
+    p.add_argument("--batch-size",     default=None, type=int)
+    p.add_argument("--nce-batch-size", default=256,  type=int,
+                   help="Mini-batch size for NCE computation.")
     return p.parse_args()
 
 
@@ -43,21 +48,9 @@ def main() -> None:
     ckpt_path = find_checkpoint(run_dir, args.epoch)
     run_args  = json.loads((run_dir / "args.json").read_text())
 
-    def _require(d: dict, *keys: str) -> Any:
-        for k in keys:
-            if k not in d:
-                raise SystemExit(f"args.json missing required key '{k}' in {keys}")
-            d = d[k]
-        return d
-
-    _require(run_args, "data")
-    _require(run_args, "optimizer")
-    _require(run_args, "method_kwargs")
-    _require(run_args, "augmentations")
-
-    data_root   = _require(run_args["data"],       "train_path")
-    num_workers = _require(run_args["data"],       "num_workers")
-    batch_size  = int(_require(run_args["optimizer"],  "batch_size"))
+    data_root   = args.data_root  or run_args["data"]["train_path"]
+    num_workers = args.num_workers if args.num_workers is not None else run_args["data"]["num_workers"]
+    batch_size  = args.batch_size  or run_args["optimizer"]["batch_size"]
     temperature = run_args["method_kwargs"].get("temperature", 0.2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,7 +75,7 @@ def main() -> None:
 
     results = compute_disentanglement(
         encode_fn, train_loader_tv, device,
-        temperature=temperature, nce_batch_size=batch_size,
+        temperature=temperature, nce_batch_size=args.nce_batch_size,
     )
 
     print(f"\n[{args.layer}]")
