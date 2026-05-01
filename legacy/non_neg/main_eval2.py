@@ -443,7 +443,7 @@ def _batched_nce(
         z2b = z2[start:start + batch_size]
         B   = z1b.shape[0]
         # cat views then normalize — same as training: z = F.normalize(cat(views), dim=-1)
-        z       = F.normalize(torch.cat([z1b, z2b], dim=0), dim=-1)
+        z       = torch.cat([z1b, z2b], dim=0)
         indexes = torch.arange(B, device=z.device).repeat(2)
         total  += simclr_loss_func(z, indexes=indexes, temperature=temperature).item()
         n_batches += 1
