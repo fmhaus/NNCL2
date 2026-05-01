@@ -442,8 +442,8 @@ def _batched_nce(
         z1b = z1[start:start + batch_size]
         z2b = z2[start:start + batch_size]
         B   = z1b.shape[0]
-        # cat views then normalize — same as training: z = F.normalize(cat(views), dim=-1)
         z       = torch.cat([z1b, z2b], dim=0)
+        z       = F.normalize(z, dim=-1)
         indexes = torch.arange(B, device=z.device).repeat(2)
         total  += simclr_loss_func(z, indexes=indexes, temperature=temperature).item()
         n_batches += 1
@@ -455,8 +455,8 @@ def compute_disentanglement(
     encode_fn:             Callable[[torch.Tensor], torch.Tensor],
     train_loader_two_view: DataLoader,
     device:                torch.device,
-    temperature:           float = 0.1,
-    nce_batch_size:        int   = 256,
+    temperature:           float,
+    nce_batch_size:        int,
 ) -> Dict:
     """SEPIN@1/10/100/all via leave-one-out NCE on two-view train features.
 
