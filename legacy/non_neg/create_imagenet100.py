@@ -6,10 +6,8 @@ Storage needed: ~13 GB
 
 Usage:
   uv run python create_imagenet100.py \
-    --train-tar /path/to/ILSVRC2012_img_train.tar \
-    --val-tar   /path/to/ILSVRC2012_img_val.tar \
-    --devkit    /path/to/ILSVRC2012_devkit_t12.tar.gz \
-    --output    ./imagenet100
+    --dataset-path /path/to/ilsvrc2012 \
+    --output       ./imagenet100
 """
 
 import argparse
@@ -23,11 +21,9 @@ CLASSES_FILE = Path(__file__).parent / "solo/data/dataset_subset/imagenet100_cla
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--train-tar", required=True)
-    p.add_argument("--val-tar",   required=True)
-    p.add_argument("--devkit",    required=True,
-                   help="ILSVRC2012_devkit_t12.tar.gz — used to sort val images.")
-    p.add_argument("--output",    required=True)
+    p.add_argument("--dataset-path", required=True,
+                   help="Directory containing the ILSVRC2012 tar files.")
+    p.add_argument("--output", required=True)
     return p.parse_args()
 
 
@@ -122,15 +118,25 @@ def extract_val(val_tar: str, devkit: str, output_dir: Path, classes: set) -> No
 
 def main() -> None:
     args    = parse_args()
+    src     = Path(args.dataset_path)
     classes = set(CLASSES_FILE.read_text().split())
     output  = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
+    train_tar = src / "ILSVRC2012_img_train.tar"
+    val_tar   = src / "ILSVRC2012_img_val.tar"
+    devkit    = src / "ILSVRC2012_devkit_t12.tar.gz"
+
+    for f in (train_tar, val_tar, devkit):
+        if not f.exists():
+            raise SystemExit(f"File not found: {f}")
+
+    print(f"Source : {src}")
     print(f"Output : {output}")
     print(f"Classes: {len(classes)}\n")
 
-    extract_train(args.train_tar, output, classes)
-    extract_val(args.val_tar, args.devkit, output, classes)
+    extract_train(str(train_tar), output, classes)
+    extract_val(str(val_tar), str(devkit), output, classes)
 
     print(f"\nDone. Dataset at: {output}")
     print(f"  train: {sum(1 for _ in (output/'train').rglob('*.JPEG'))} images")
