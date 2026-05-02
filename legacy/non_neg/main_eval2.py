@@ -179,12 +179,14 @@ def load_legacy_checkpoint(ckpt_path: Path, run_args: dict) -> Tuple[LegacySimCL
     proj_output = mk["proj_output_dim"]
     non_neg     = mk.get("non_neg")
 
-    # Backbone — ResNet18 with the legacy CIFAR patch used in solo-learn base.py:
-    # 3×3 conv with padding=2, no maxpool, fc removed
+    # Backbone — ResNet18, fc removed.
+    # CIFAR datasets use a 3×3 stride-1 conv and no maxpool to preserve spatial resolution
+    # at 32×32. ImageNet keeps the standard 7×7 stride-2 conv and maxpool.
     backbone = resnet18(weights=None)
-    backbone.conv1   = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=2, bias=False)
-    backbone.maxpool  = nn.Identity()
-    backbone.fc       = nn.Identity()
+    backbone.fc = nn.Identity()
+    if run_args["data"]["dataset"] in ("cifar10", "cifar100"):
+        backbone.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=2, bias=False)
+        backbone.maxpool = nn.Identity()  # type: ignore[assignment]
 
     # Projector — 2-layer MLP (no BN), matching legacy solo SimCLR
     proj_layers: List[nn.Module] = [
