@@ -33,34 +33,30 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_devkit(devkit_path: str) -> dict:
     """Return {1-based val image index: wnid} for all 50000 val images."""
-    import re
+    import tempfile
+    import scipy.io
 
-    with tarfile.open(devkit_path, "r:gz") as outer:
-        # ground truth: ILSVRC2012_devkit_t12/data/ILSVRC2012_validation_ground_truth.txt
+    with tarfile.open(devkit_path, "r:gz") as tf:
         gt_member = next(
-            m for m in outer.getmembers()
+            m for m in tf.getmembers()
             if m.name.endswith("ILSVRC2012_validation_ground_truth.txt")
         )
-        gt_text = outer.extractfile(gt_member).read().decode()
-        # one class-index (1-1000) per line, in val image order
-        class_indices = [int(x) for x in gt_text.split()]
+        class_indices = [int(x) for x in tf.extractfile(gt_member).read().decode().split()]
 
-        # meta.mat contains the synset info; parse wnids without scipy using raw bytes
-        meta_member = next(m for m in outer.getmembers() if m.name.endswith("meta.mat"))
-        meta_bytes   = outer.extractfile(meta_member).read()
+        meta_member = next(m for m in tf.getmembers() if m.name.endswith("meta.mat"))
+        meta_bytes  = tf.extractfile(meta_member).read()
 
-    # Extract all wnid strings (nXXXXXXXX) from the binary .mat in order
-    wnids = re.findall(rb"(n\d{8})", meta_bytes)
-    # They appear paired: first occurrence is the wnid for class index 1..1000
-    wnids = [w.decode() for w in wnids]
-    # .mat stores wnids in synset order; deduplicate while preserving order
-    seen, unique_wnids = set(), []
-    for w in wnids:
-        if w not in seen:
-            seen.add(w)
-            unique_wnids.append(w)
-    # unique_wnids[i] corresponds to class index i+1
-    idx_to_wnid = {i + 1: w for i, w in enumerate(unique_wnids)}
+    # scipy.io.loadmat needs a file path or seekable file-like object
+    with tempfile.NamedTemporaryFile(suffix=".mat", delete=False) as tmp:
+        tmp.write(meta_bytes)
+        tmp_path = tmp.name
+
+    meta = scipy.io.loadmat(tmp_path)
+    Path(tmp_path).unlink()
+
+    # synsets[:,0] is an array of structs; field 0 = ILSVRC2012_ID, field 1 = WNID
+    synsets    = meta["synsets"][:, 0]
+    idx_to_wnid = {int(s[0][0, 0]): str(s[1][0]) for s in synsets}
 
     return {i + 1: idx_to_wnid[cls_idx] for i, cls_idx in enumerate(class_indices)}
 
