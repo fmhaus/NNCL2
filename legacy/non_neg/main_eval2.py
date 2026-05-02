@@ -174,10 +174,14 @@ def load_legacy_checkpoint(ckpt_path: Path, run_args: dict) -> Tuple[LegacySimCL
     that projector[:2] still returns the 2048-dim hidden representation and
     projector(enc) returns the activation-gated output — matching the training setup.
     """
-    mk = run_args["method_kwargs"]
-    proj_hidden = mk["proj_hidden_dim"]
-    proj_output = mk["proj_output_dim"]
-    non_neg     = mk.get("non_neg")
+    mk      = run_args["method_kwargs"]
+    non_neg = mk.get("non_neg")
+
+    # Load checkpoint first to infer projector shape — args.json may not match the actual weights
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd   = ckpt["state_dict"]
+    proj_hidden = sd["projector.0.weight"].shape[0]   # Linear(512 → proj_hidden)
+    proj_output = sd["projector.2.weight"].shape[0]   # Linear(proj_hidden → proj_output)
 
     # Backbone — ResNet18, fc removed.
     # CIFAR datasets use a 3×3 stride-1 conv and no maxpool to preserve spatial resolution
@@ -197,9 +201,6 @@ def load_legacy_checkpoint(ckpt_path: Path, run_args: dict) -> Tuple[LegacySimCL
     if non_neg is not None and non_neg in _NON_NEG_MODULES:
         proj_layers.append(_NON_NEG_MODULES[non_neg])
     projector = nn.Sequential(*proj_layers)
-
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd   = ckpt["state_dict"]
 
     backbone_sd  = {k[len("backbone."):]:  v for k, v in sd.items() if k.startswith("backbone.")}
     projector_sd = {k[len("projector."):]: v for k, v in sd.items() if k.startswith("projector.")}
