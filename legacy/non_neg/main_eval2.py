@@ -176,6 +176,8 @@ def load_legacy_checkpoint(ckpt_path: Path, run_args: dict) -> Tuple[LegacySimCL
     """
     mk      = run_args["method_kwargs"]
     non_neg = mk.get("non_neg")
+    if non_neg == "None":
+        non_neg = None
 
     # Load checkpoint first to infer projector shape — args.json may not match the actual weights
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -471,6 +473,46 @@ def _batched_nce(
     return total / n_batches
 
 
+def _full_nce(
+    z1: torch.Tensor, z2: torch.Tensor,
+    temperature: float, chunk_size: int = 512,
+) -> float:
+    """NCE loss where every example uses ALL 2N examples as the denominator.
+
+    Unlike _batched_nce (independent mini-batches, B-1 negatives each), here each
+    example's softmax denominator sums over the full 2N-1 other vectors.
+    This matches the paper's likely formulation and avoids the collapse-to-zero problem
+    that occurs when the model is good relative to the mini-batch size.
+
+    Memory: O(chunk_size × 2N) — chunk_size=512 uses ~200 MB for N=50K.
+    """
+    N  = z1.shape[0]
+    z  = F.normalize(torch.cat([z1, z2], dim=0), dim=-1)  # (2N, D)
+    TN = 2 * N
+
+    # positive of z[i] is z[i+N] for i<N and z[i-N] for i>=N
+    pos_idx = torch.cat([
+        torch.arange(N, TN, device=z.device),
+        torch.arange(0, N,  device=z.device),
+    ])
+
+    total_loss = 0.0
+    for start in range(0, TN, chunk_size):
+        end   = min(start + chunk_size, TN)
+        C     = end - start
+        sims  = torch.exp((z[start:end] @ z.T) / temperature)  # (C, 2N)
+
+        # mask out self-similarity so it doesn't enter the denominator
+        local_range = torch.arange(C, device=z.device)
+        sims[local_range, torch.arange(start, end, device=z.device)] = 0.0
+
+        pos_sims = sims[local_range, pos_idx[start:end]]   # (C,)
+        denoms   = sims.sum(dim=1)                          # (C,)
+        total_loss += torch.log(pos_sims / denoms).sum().item()
+
+    return -total_loss / TN
+
+
 @torch.no_grad()
 def compute_disentanglement(
     encode_fn:             Callable[[torch.Tensor], torch.Tensor],
@@ -478,13 +520,18 @@ def compute_disentanglement(
     device:                torch.device,
     temperature:           float,
     nce_batch_size:        int,
+    use_full_nce:          bool = False,
+    full_nce_chunk:        int  = 512,
 ) -> Dict:
     """SEPIN@1/10/100/all via leave-one-out NCE on two-view train features.
 
     encode_fn must return raw (pre-normalization) projector outputs, matching the
     point in training right before F.normalize is called.
-    Normalization is applied fresh inside each _batched_nce call — both for the
+    Normalization is applied fresh inside each NCE call — both for the
     full-D baseline and for every (D-1)-dim leave-one-out slice.
+
+    use_full_nce=True uses _full_nce (all 2N negatives per example) instead of
+    _batched_nce (independent mini-batches of nce_batch_size).
     """
     nb = device.type == "cuda"
     print("  extracting two-view train features...", end=" ", flush=True)
@@ -492,22 +539,27 @@ def compute_disentanglement(
     for x1, x2, _ in train_loader_two_view:
         z1_list.append(encode_fn(x1.to(device, non_blocking=nb)))
         z2_list.append(encode_fn(x2.to(device, non_blocking=nb)))
-    # Keep raw (unnormalized) — normalization happens inside _batched_nce
+    # Keep raw (unnormalized) — normalization happens inside the NCE helpers
     z1 = torch.cat(z1_list)
     z2 = torch.cat(z2_list)
     print("done")
 
     D = z1.shape[1]
 
-    nce_full = _batched_nce(z1, z2, temperature, nce_batch_size)
-    print(f"  NCE full (D={D}): {nce_full:.4f}")
+    def _nce(a, b):
+        if use_full_nce:
+            return _full_nce(a, b, temperature, full_nce_chunk)
+        return _batched_nce(a, b, temperature, nce_batch_size)
 
-    # Leave-one-out: slicing stays on device; _batched_nce re-normalizes the (D-1)-dim slice
+    nce_full = _nce(z1, z2)
+    mode_tag = f"full-N={len(z1)}" if use_full_nce else f"batch={nce_batch_size}"
+    print(f"  NCE full (D={D}, {mode_tag}): {nce_full:.4f}")
+
     all_idx = torch.arange(D, device=device)
     deltas  = torch.empty(D)
     for i in range(D):
         keep      = torch.cat([all_idx[:i], all_idx[i + 1:]])
-        deltas[i] = _batched_nce(z1[:, keep], z2[:, keep], temperature, nce_batch_size) - nce_full
+        deltas[i] = _nce(z1[:, keep], z2[:, keep]) - nce_full
 
     deltas_ranked = deltas.sort(descending=True).values
 
@@ -562,12 +614,17 @@ def parse_args() -> argparse.Namespace:
                    help="Checkpoint epoch to evaluate. Default: highest available.")
     p.add_argument("--data-root", default=None,
                    help="Override data train_path from args.json.")
+    p.add_argument("--val-path", default=None,
+                   help="Override val_path from args.json (required for ImageNet if path is relative).")
     p.add_argument("--num-workers", default=None, type=int,
                    help="Override num_workers from args.json.")
     p.add_argument("--n-select", default=128, type=int,
                    help="Feature dims for rand/EA subset evaluations.")
     p.add_argument("--probe-epochs", default=100, type=int)
     p.add_argument("--probe-lr", default=0.1, type=float)
+    p.add_argument("--full-nce", action="store_true",
+                   help="Use full-dataset NCE for SEPIN (all 2N negatives per example).")
+    p.add_argument("--full-nce-chunk", default=512, type=int)
     return p.parse_args()
 
 
@@ -587,12 +644,14 @@ def main() -> None:
 
     run_args = json.loads(args_path.read_text())
 
-    data_root   = args.data_root   or run_args["data"]["train_path"]
+    data_root   = args.data_root or run_args["data"]["train_path"]
     num_workers = args.num_workers if args.num_workers is not None else run_args["data"]["num_workers"]
     batch_size  = run_args["optimizer"]["batch_size"]
     temperature = run_args["method_kwargs"].get("temperature", 0.2)
     num_classes = run_args["data"]["num_classes"]
     non_neg     = run_args["method_kwargs"].get("non_neg")
+    if non_neg == "None":
+        non_neg = None
 
     print(f"Checkpoint : {ckpt_path}")
     print(f"Model name : {run_args['name']}")
@@ -608,7 +667,7 @@ def main() -> None:
         raise SystemExit(f"Unsupported dataset '{dataset}'. Supported: {list(_DATASET_STATS)}")
     mean, std = _DATASET_STATS[dataset]
 
-    val_path = run_args["data"].get("val_path", data_root)
+    val_path = args.val_path or run_args["data"].get("val_path", data_root)
 
     if dataset == "cifar100":
         clean_t = transforms.Compose([
@@ -680,6 +739,7 @@ def main() -> None:
         dis = compute_disentanglement(
             encode_fn, train_loader_tv, device,
             temperature=temperature, nce_batch_size=batch_size,
+            use_full_nce=args.full_nce, full_nce_chunk=args.full_nce_chunk,
         )
         results.update({f"{name}_{k}": v for k, v in dis.items()})
 
