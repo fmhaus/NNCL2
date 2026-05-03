@@ -522,16 +522,20 @@ def compute_disentanglement(
     nce_batch_size:        int,
     use_full_nce:          bool = False,
     full_nce_chunk:        int  = 512,
+    prenorm_loo:           bool = False,
 ) -> Dict:
     """SEPIN@1/10/100/all via leave-one-out NCE on two-view train features.
 
-    encode_fn must return raw (pre-normalization) projector outputs, matching the
-    point in training right before F.normalize is called.
-    Normalization is applied fresh inside each NCE call — both for the
-    full-D baseline and for every (D-1)-dim leave-one-out slice.
+    encode_fn must return raw (pre-normalization) projector outputs.
 
-    use_full_nce=True uses _full_nce (all 2N negatives per example) instead of
-    _batched_nce (independent mini-batches of nce_batch_size).
+    prenorm_loo=True (recommended): normalize the full D-dim vector first, then slice.
+      The LOO vector has norm sqrt(1 - z̃_i²) < 1 — feature i's energy is truly absent.
+      This matches the paper's interpretation of f_{!=i}(x) as a coordinate of the
+      unit-sphere representation with dimension i zeroed out.
+
+    prenorm_loo=False (original): slice unnormalized features, then re-normalize the
+      (D-1)-dim slice. The remaining features compensate for the missing one, which
+      shrinks deltas.
     """
     nb = device.type == "cuda"
     print("  extracting two-view train features...", end=" ", flush=True)
@@ -539,21 +543,30 @@ def compute_disentanglement(
     for x1, x2, _ in train_loader_two_view:
         z1_list.append(encode_fn(x1.to(device, non_blocking=nb)))
         z2_list.append(encode_fn(x2.to(device, non_blocking=nb)))
-    # Keep raw (unnormalized) — normalization happens inside the NCE helpers
     z1 = torch.cat(z1_list)
     z2 = torch.cat(z2_list)
     print("done")
 
     D = z1.shape[1]
 
+    # pre-normalize once if using prenorm_loo; raw otherwise
+    if prenorm_loo:
+        z1 = F.normalize(z1, dim=-1)
+        z2 = F.normalize(z2, dim=-1)
+
+    _do_norm = not prenorm_loo
+
     def _nce(a, b):
         if use_full_nce:
-            return _full_nce(a, b, temperature, full_nce_chunk)
-        return _batched_nce(a, b, temperature, nce_batch_size)
+            return _full_nce(a, b, temperature, full_nce_chunk, normalize=_do_norm)
+        return _batched_nce(a, b, temperature, nce_batch_size, normalize=_do_norm)
 
     nce_full = _nce(z1, z2)
-    mode_tag = f"full-N={len(z1)}" if use_full_nce else f"batch={nce_batch_size}"
-    print(f"  NCE full (D={D}, {mode_tag}): {nce_full:.4f}")
+    mode_parts = []
+    if prenorm_loo:   mode_parts.append("prenorm_loo")
+    if use_full_nce:  mode_parts.append(f"full-N={len(z1)}")
+    else:             mode_parts.append(f"batch={nce_batch_size}")
+    print(f"  NCE full (D={D}, {', '.join(mode_parts)}): {nce_full:.4f}")
 
     all_idx = torch.arange(D, device=device)
     deltas  = torch.empty(D)

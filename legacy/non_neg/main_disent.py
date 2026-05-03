@@ -38,10 +38,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nce-batch-size", default=256,  type=int,
                    help="Mini-batch size for NCE computation.")
     p.add_argument("--full-nce", action="store_true",
-                   help="Use full-dataset NCE (all 2N negatives per example). "
-                        "Slower but matches paper's likely formulation.")
+                   help="Use full-dataset NCE (all 2N negatives per example).")
     p.add_argument("--full-nce-chunk", default=512, type=int,
                    help="Row-chunk size for full-NCE memory management.")
+    p.add_argument("--prenorm-loo", action="store_true",
+                   help="Normalize the full D-dim vector before slicing. "
+                        "LOO vectors have norm sqrt(1-z_i^2) — feature i's energy "
+                        "is absent without compensating re-normalization.")
     return p.parse_args()
 
 
@@ -91,6 +94,7 @@ def main() -> None:
         encode_fn, train_loader_tv, device,
         temperature=temperature, nce_batch_size=args.nce_batch_size,
         use_full_nce=args.full_nce, full_nce_chunk=args.full_nce_chunk,
+        prenorm_loo=args.prenorm_loo,
     )
 
     print(f"\n[{args.layer}]")
