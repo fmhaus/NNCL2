@@ -453,20 +453,21 @@ def evaluate_feature_subsets(
 def _batched_nce(
     z1: torch.Tensor, z2: torch.Tensor,
     temperature: float, batch_size: int,
+    normalize: bool = True,
 ) -> float:
     """simclr_loss_func averaged over mini-batches.
 
-    z1/z2 are raw (unnormalized) features, already on the target device.
-    Each call mirrors training exactly:
-      cat views → F.normalize (full or sliced D) → indexes → simclr_loss_func
+    normalize=False: skip F.normalize — use when vectors are already pre-normalized
+    (prenorm_loo mode, where slices of full-D unit-norm vectors must not be re-normalized).
     """
     total, n_batches = 0.0, 0
     for start in range(0, len(z1), batch_size):
         z1b = z1[start:start + batch_size]
         z2b = z2[start:start + batch_size]
         B   = z1b.shape[0]
-        z       = torch.cat([z1b, z2b], dim=0)
-        z       = F.normalize(z, dim=-1)
+        z   = torch.cat([z1b, z2b], dim=0)
+        if normalize:
+            z = F.normalize(z, dim=-1)
         indexes = torch.arange(B, device=z.device).repeat(2)
         total  += simclr_loss_func(z, indexes=indexes, temperature=temperature).item()
         n_batches += 1
@@ -476,18 +477,17 @@ def _batched_nce(
 def _full_nce(
     z1: torch.Tensor, z2: torch.Tensor,
     temperature: float, chunk_size: int = 512,
+    normalize: bool = True,
 ) -> float:
     """NCE loss where every example uses ALL 2N examples as the denominator.
 
-    Unlike _batched_nce (independent mini-batches, B-1 negatives each), here each
-    example's softmax denominator sums over the full 2N-1 other vectors.
-    This matches the paper's likely formulation and avoids the collapse-to-zero problem
-    that occurs when the model is good relative to the mini-batch size.
-
+    normalize=False: skip F.normalize — use when vectors are already pre-normalized.
     Memory: O(chunk_size × 2N) — chunk_size=512 uses ~200 MB for N=50K.
     """
     N  = z1.shape[0]
-    z  = F.normalize(torch.cat([z1, z2], dim=0), dim=-1)  # (2N, D)
+    z  = torch.cat([z1, z2], dim=0)
+    if normalize:
+        z = F.normalize(z, dim=-1)
     TN = 2 * N
 
     # positive of z[i] is z[i+N] for i<N and z[i-N] for i>=N
