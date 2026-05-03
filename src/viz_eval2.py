@@ -60,7 +60,7 @@ def load_data(name: str, epoch: int | None):
     else:
         path = npz_files[-1]
     print(f"Loading '{path}'")
-    return np.load(path, allow_pickle=True)
+    return np.load(path, allow_pickle=True), path
 
 
 def detect_layers(data) -> list[str]:
@@ -131,7 +131,7 @@ def plot_probe(ax, data, layer: str, n: int) -> None:
     ax.set_title("probe acc & mAP@10", fontsize=9)
 
 
-def plot_sepin(ax, data, layer: str) -> None:
+def plot_sepin(ax, data, layer: str, ylim_max: float = 0.005) -> None:
     labels = ["@1", "@10", "@100", "@all"]
     keys   = [f"{layer}_sepin_1", f"{layer}_sepin_10",
               f"{layer}_sepin_100", f"{layer}_sepin_all"]
@@ -141,7 +141,7 @@ def plot_sepin(ax, data, layer: str) -> None:
     colors = [ACCENT[2] if v >= 0 else ACCENT[3] for v in values]
     ax.bar(x, values, color=colors, zorder=3)
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_ylim(0, 0.005)
+    ax.set_ylim(0, ylim_max)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9)
     ax.tick_params(axis="y", labelsize=8)
@@ -186,9 +186,10 @@ def main():
             raise SystemExit(f"'{p}' not found.")
         print(f"Loading '{p}'")
         data  = np.load(p, allow_pickle=True)
+        npz_path = p
         label = p.stem
     else:
-        data  = load_data(args.name, args.epoch)
+        data, npz_path = load_data(args.name, args.epoch)
         label = args.name
     if args.label:
         label = args.label
@@ -209,12 +210,20 @@ def main():
         top=0.965, bottom=0.04, left=0.07, right=0.97,
     )
 
+    sepin_keys = [f"{l}_sepin_{s}" for l in layers for s in ("1", "10", "100", "all")]
+    sepin_max  = max((get(data, k) or 0.0 for k in sepin_keys), default=0.005)
+    sepin_ylim = max(sepin_max * 1.1, 1e-9)
+
     for col, layer in enumerate(layers):
         n_sel = detect_n_select(data, layer)
         plot_scalars(fig.add_subplot(gs[0, col]), data, layer)
         plot_probe  (fig.add_subplot(gs[1, col]), data, layer, n_sel)
-        plot_sepin  (fig.add_subplot(gs[2, col]), data, layer)
+        plot_sepin  (fig.add_subplot(gs[2, col]), data, layer, sepin_ylim)
         plot_corr   (fig.add_subplot(gs[3, col]), data, layer)
+
+    auto_save = npz_path.with_suffix(".png")
+    fig.savefig(auto_save, dpi=150, bbox_inches="tight")
+    print(f"Saved → {auto_save}")
 
     if args.save:
         fig.savefig(args.save, dpi=150, bbox_inches="tight")
